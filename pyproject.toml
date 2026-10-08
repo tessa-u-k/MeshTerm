@@ -103,6 +103,8 @@ exclude = [
     "/.gitattributes",
     "/CLAUDE.md",
     "/docs/development/survey-*.md",
+    "/default.nix",
+    "/nix",
     "/packaging",
     "/scripts",
 ]
