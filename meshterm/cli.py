@@ -351,6 +351,21 @@ def main_callback(
         known = ", ".join(sorted(settings.profiles)) or "none are defined"
         raise typer.BadParameter(f"no device profile named {profile!r} (known: {known})")
 
+    if ctx.invoked_subcommand is None and not json_output:
+        # The interactive session keeps the stores in memory and rewrites them whole. Thus it
+        # is the session that claims the directory. One-shot subcommands are short and
+        # mostly read data. If an open menu in another window blocked `meshterm contacts`,
+        # that would be an obstacle and not a guard.
+        # The session claims the directory before it opens the database. The
+        # open writes the schema version. If another session holds a write transaction,
+        # that write waits, then fails with "database is locked" and a traceback. The lock
+        # gives the clear message first. The context releases the lock when it closes.
+        try:
+            ctx.with_resource(hold_instance_lock(settings.config_dir))
+        except InstanceBusy as exc:
+            console.print(f"[err]✗[/err] {exc}")
+            raise typer.Exit(code=1) from None
+
     app_ctx = AppContext(
         preferences=prefs,
         console=console,
@@ -403,10 +418,6 @@ def main_callback(
         saved_font = vt_console_font.remember()
         vt_console_font.apply(prefs.get("console_font"))
 
-        # The interactive session keeps the stores in memory and rewrites them whole. Thus it
-        # is the session that claims the directory. One-shot subcommands are short and
-        # mostly read data. If an open menu in another window blocked `meshterm contacts`,
-        # that would be an obstacle and not a guard.
         # A SIGTERM (the end of a held Esc from the launcher of the Cardputer, or a system
         # that shuts down) makes the menu leave in the same way as Quit. It does not stop
         # the menu at the place where it was.
@@ -414,11 +425,7 @@ def main_callback(
 
         hold_to_quit.leave_on_sigterm()
         try:
-            with hold_instance_lock(settings.config_dir):
-                asyncio.run(_drive(run_menu(app_ctx), app_ctx))
-        except InstanceBusy as exc:
-            console.print(f"[err]✗[/err] {exc}")
-            raise typer.Exit(code=1) from None
+            asyncio.run(_drive(run_menu(app_ctx), app_ctx))
         except Exception as exc:
             if type(exc).__name__ == "NoConsoleScreenBufferError":
                 # prompt_toolkit needs a real Win32 console. It reports that the console is

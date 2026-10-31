@@ -112,3 +112,26 @@ def test_a_failed_write_leaves_no_litter(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(OSError):
         write_atomically(tmp_path / "y.json", "{}")
     assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_a_second_menu_stops_before_it_opens_the_database(tmp_path: Path, monkeypatch) -> None:
+    """The second session gives the clear message, and does not touch the database.
+
+    The open of the database writes the schema version. If the first session holds a write
+    transaction, that write waits, and then fails with "database is locked" and a
+    traceback. Thus the session must claim the directory before the open.
+    """
+    from typer.testing import CliRunner
+
+    from meshterm import cli
+
+    monkeypatch.setenv("MESHTERM_HOME", str(tmp_path))
+
+    def no_open(*_args, **_kwargs):
+        raise AssertionError("the database opened before the lock was checked")
+
+    monkeypatch.setattr(cli, "Repository", no_open)
+    with hold_instance_lock(tmp_path):
+        result = CliRunner().invoke(cli.app, ["--mock"])
+    assert result.exit_code == 1, result.output
+    assert "Another MeshTerm is already using" in result.output
