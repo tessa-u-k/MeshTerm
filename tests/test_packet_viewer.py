@@ -158,7 +158,7 @@ def test_packet_viewer_follows_the_stream_off_the_top_of_a_live_list() -> None:
         source=lambda: list(feed),
         on_pin=lambda: pinned_by_viewer.append(True),
     )
-    assert not viewer._pinned, "opening a packet named that packet, not the stream"
+    assert not viewer._pinned, "an open without pinned holds the packet, not the stream"
     assert "↑ follow" in viewer.footer_hint
 
     viewer.handle("up")
@@ -174,6 +174,35 @@ def test_packet_viewer_follows_the_stream_off_the_top_of_a_live_list() -> None:
     viewer.handle("down")
     assert not viewer._pinned and viewer._entries[viewer._index] is newer
     assert "1/2" in viewer.title  # the viewer holds that packet, which now moves down the list
+
+
+def test_packet_viewer_opens_on_the_pin_of_a_live_list() -> None:
+    """``pinned`` opens on the pin: the card follows the stream from the first paint.
+
+    The open does not call ``on_pin``, because the list is already on its own pin. Over a
+    snapshot, ``pinned`` does nothing, because there is no stream to follow.
+    """
+    old = PacketEntry(when=utcnow(), kind="advert", node="aa")
+    feed = [old]
+    pinned_by_viewer = []
+    viewer = PacketViewer(
+        list(feed),
+        0,
+        pinned=True,
+        resolve=lambda h: "",
+        source=lambda: list(feed),
+        on_pin=lambda: pinned_by_viewer.append(True),
+    )
+    assert viewer._pinned and viewer.title.endswith("· following")
+    assert "↓ hold packet" in viewer.footer_hint
+    assert pinned_by_viewer == []
+
+    newer = PacketEntry(when=utcnow(), kind="message", node="bb", text="new!")
+    feed.insert(0, newer)
+    assert "new!" in _plain(viewer.render_body(80))
+
+    snapshot = PacketViewer([newer, old], 0, pinned=True, resolve=lambda h: "")
+    assert not snapshot._pinned and "following" not in snapshot.title
 
 
 def test_packet_viewer_over_a_snapshot_has_nothing_to_follow() -> None:
@@ -404,6 +433,37 @@ def test_packet_viewer_lays_out_what_a_frame_addressed() -> None:
     assert "Alice" in from_row and "a1" in from_row
     # …and the generic raw dump at the end of the card does not repeat either one.
     assert _plain(lines).count("dest_hash") == 0
+
+
+def test_packet_viewer_draws_each_end_of_the_route_as_the_chip_of_that_end(powerline) -> None:
+    """The sender closes on the point and the recipient opens on the notch, around ``via``."""
+    from meshterm.ui.pathline import POWERLINE_ROUND_CLOSE, POWERLINE_ROUND_OPEN, POWERLINE_SEP
+
+    powerline(True)
+    entry = PacketEntry(
+        when=utcnow(),
+        kind="packet",
+        path="3d",
+        raw={
+            "payload_typename": "TEXT_MSG",
+            "route_typename": "FLOOD",
+            "dest_hash": "c0",
+            "src_hash": "a1",
+        },
+    )
+    viewer = PacketViewer(
+        [entry],
+        0,
+        resolve=lambda h: {"c0": "Waymarker", "a1": "Alice"}.get(h, ""),
+        prefix_bytes=1,
+        self_name="Waymarker",
+    )
+    lines = _stripped(viewer.render_body(80))
+    to_row = next(ln for ln in lines if ln.startswith("to"))
+    from_row = next(ln for ln in lines if ln.startswith("from"))
+
+    assert f"{POWERLINE_SEP} Waymarker {POWERLINE_ROUND_CLOSE}  c0" in to_row  # us, reached
+    assert f"{POWERLINE_ROUND_OPEN} Alice {POWERLINE_SEP}  a1" in from_row  # the route goes on
 
 
 def test_packet_viewer_names_a_tokened_frame_by_its_token() -> None:

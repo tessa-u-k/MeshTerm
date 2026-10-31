@@ -30,13 +30,15 @@ say "and if it's the trace picker…".
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from rich.cells import cell_len
 from rich.text import Text
 
-from .marks import SELF_MARK
+from .marks import LOCK_ICON, SELF_MARK
 from .menus import fit_cells
 from .theme import glyph, name_style
 from .tui.select import Choice, SelectScreen, Separator
@@ -132,14 +134,6 @@ TRACE_LANES: tuple[ContactLane, ...] = (TRACED_LANE, HEARD_LANE, PKTS_LANE)
 #: what the contact still transmits. It is about when the contact left.
 ARCHIVED_LANES: tuple[ContactLane, ...] = (ARCHIVED_LANE,)
 
-#: The padlock at the start of the row of a locked contact (refer to
-#: :attr:`ContactRow.locked`). It is the private-channel ``🔒`` of the icon lexicon, because
-#: it means the same thing (this item is closed to something). On the PicoCalc,
-#: :func:`~meshterm.ui.theme.glyph` gives the hand-drawn padlock ``⚿`` of the font. An
-#: unlocked contact draws nothing. The mark is an exception that the user must notice, and a
-#: lane of open padlocks makes the few closed padlocks hard to see.
-_LOCK_ICON = "🔒"
-
 
 def _lock_lane_width(rows: list[ContactRow]) -> int:
     """The width of the lock column in cells: the platform padlock and its gap, or ``0``.
@@ -150,7 +144,7 @@ def _lock_lane_width(rows: list[ContactRow]) -> int:
     """
     if not any(row.locked for row in rows):
         return 0
-    return cell_len(glyph(_LOCK_ICON)) + 1
+    return cell_len(glyph(LOCK_ICON)) + 1
 
 
 def _lock_cell(row: ContactRow, lock_w: int) -> str:
@@ -159,7 +153,7 @@ def _lock_cell(row: ContactRow, lock_w: int) -> str:
         return ""
     if not row.locked:
         return " " * lock_w
-    mark = glyph(_LOCK_ICON)
+    mark = glyph(LOCK_ICON)
     return mark + " " * (lock_w - cell_len(mark))
 
 
@@ -242,7 +236,7 @@ class ContactRow:
             a muted ``?``.
         node_type: The node type of the contact, for the leading glyph (``None`` = the
             plain node ``●``). The row of our node ignores it, and always starts with the
-            yellow ``★``.
+            white ``★``.
         last_seen: When MeshTerm last heard the contact (aware UTC). It fills the heard
             lane, in the colour of the recency heat. ``None`` shows ``never`` in the cold
             style.
@@ -359,7 +353,7 @@ def _you_lane(
     """The lane of our node, with the same layout as the usual rows of :func:`_lane`.
 
     It is drawn as the map and the static table draw our node: the ``★`` self marker
-    (yellow), the name in the pure-white ``you`` style with a muted ``(you)`` tag, and our
+    (white), the name in the pure-white ``you`` style with a muted ``(you)`` tag, and our
     key with its hash lit at the routing width, in the flexible key lane. Our 64-hex key is
     longer than any lane, so it shows as many digits as fit, and then an ellipsis. **Each
     middle lane shows a faint ``—``**, whatever lanes the list declares. MeshTerm never
@@ -571,6 +565,7 @@ class ContactListScreen(SelectScreen):
         tail: list | None = None,
         footer_hint: str = _HINT,
         lanes: tuple[ContactLane, ...] = DEFAULT_LANES,
+        key_hint: Callable[[Any], str] | None = None,
     ) -> None:
         """Build the list over rows that are already resolved.
 
@@ -599,6 +594,9 @@ class ContactListScreen(SelectScreen):
             footer_hint: The key hint of the footer. The default shows the full grammar.
             lanes: The fixed lanes drawn between the name and the key of each row. Refer
                 to :data:`DEFAULT_LANES`, :data:`TRACE_LANES`, and :data:`ARCHIVED_LANES`.
+            key_hint: The hint atoms for the shortcut keys that act on the highlighted row
+                (refer to :class:`~meshterm.ui.tui.select.SelectScreen`). ``None`` for a list
+                with no such keys.
         """
         self._contact_rows = rows
         self._prefix_bytes = prefix_bytes
@@ -615,6 +613,7 @@ class ContactListScreen(SelectScreen):
             self._compose_items(),
             prompt=prompt,
             footer_hint=footer_hint,
+            key_hint=key_hint,
         )
 
     def _compose_items(self) -> list:

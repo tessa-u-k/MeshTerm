@@ -9,7 +9,9 @@ type-to-filter. Thus the whole app has one contact list, for each source of data
 highlighted node (:mod:`~meshterm.ui.node_detail_screen`). That page shows the identity of
 the node, a preview of its location, the routes that MeshTerm observed to it, and the ways
 to go further (trace, map, Time Machine). When the user backs out of that page, the list is
-as it was. The one-shot CLI (``meshterm contacts --sort …``) still renders the static
+as it was. ^L opens the map on the highlighted node, when it has a location. ^K locks the
+highlighted contact against the archive sweep, or unlocks it. The one-shot
+CLI (``meshterm contacts --sort …``) still renders the static
 :func:`~meshterm.ui.widgets.contacts_table`. Only the menu gets the live list.
 
 Below the contacts is the maintenance action of the list: **Archive contacts**. It is the
@@ -43,15 +45,17 @@ from typing import TYPE_CHECKING
 
 from .archived_screen import open_archived
 from .contactlist import ContactListScreen, ContactRow
-from .menus import icon_lane, marked_label
+from .menus import icon_lane, marked_label, splice_if_room
 from .sweep_screen import archive_contacts
-from .tui import Choice, Separator
+from .tui import Choice, KeyRequest, Separator
 from .tui.screen import CANCEL
 from .widgets import ContactsSort, contact_packets
 
 if TYPE_CHECKING:
     from ..context import AppContext
     from ..core.models import Contact
+    from .map_render import MapMarker
+    from .map_screen import Locator
 
 #: A stable identity for the row of our node. The lane data of this row has no key when no
 #: device answered. Enter on this row opens the detail page of our node.
@@ -75,8 +79,33 @@ class ContactsScreen(ContactListScreen):
 
     Enter resolves the highlighted row, our node (:data:`YOU`) or a
     :class:`~meshterm.core.models.Contact`, so that :func:`open_contacts` opens it in the
-    Node detail page. The shared list handles the sort, the filter, and the navigation.
+    Node detail page. ^L resolves a :class:`~meshterm.ui.tui.select.KeyRequest` with the
+    marker of the highlighted node, so that :func:`open_contacts` opens the map on it. ^K
+    resolves one with the highlighted contact, so that :func:`open_contacts` toggles its
+    lock. The shared list handles the sort, the filter, and the navigation.
     """
+
+    @property
+    def picocalc_lyra_lane(self):
+        """The lane of the contact list, with ``Map`` (^L) and ``Lock`` (^K) on the Shift bank.
+
+        ``Map`` is on the Shift half of F1. F1 itself keeps ``Sect ↑`` when the list has
+        sections (the contacts, and the archive rows under them), and it stays empty when
+        the list has none. ``Map`` is lit while the highlighted node has a location.
+
+        ``Lock`` is on the Shift half of F2, behind ``Sect ↓``: the same key as in a channel
+        and a DM. It toggles the lock of the highlighted contact, so it reads ``Unlock`` on
+        a locked contact. It is lit on a contact that can have a lock, and dim on our node
+        and on the rows of the tail. It is empty where MeshTerm cannot store a lock.
+        """
+        lane = list(super().picocalc_lyra_lane)
+        if self._locator is not None:
+            lane[0] = _with_opp(lane[0], "Map", "locate", self._highlighted_marker() is not None)
+        if self._can_lock:
+            target = self._lock_target()
+            label = "Unlock" if target is not None and target[1] else "Lock"
+            lane[1] = _with_opp(lane[1], label, "lock", target is not None)
+        return lane
 
     def __init__(
         self,
@@ -88,6 +117,8 @@ class ContactsScreen(ContactListScreen):
         sort: ContactsSort,
         archived: int = 0,
         locked: frozenset[str] = frozenset(),
+        locator: Locator | None = None,
+        can_lock: bool = False,
     ) -> None:
         """Create the contacts screen over contact data that MeshTerm already got.
 
@@ -110,8 +141,15 @@ class ContactsScreen(ContactListScreen):
                 because a screen must not offer a way into an empty list.
             locked: The full keys (lowercase hex) of the contacts that are locked against
                 archiving. Each of those rows ends its name lane with a padlock.
+            locator: The located nodes, for ^L: the map on the highlighted node (refer to
+                :class:`~meshterm.ui.map_screen.Locator`). With ``None``, ^L does nothing.
+            can_lock: Whether the caller can store a lock, for ^K. With ``False``, ^K does
+                nothing.
         """
         self._self_name, self._self_key = self_name, self_key
+        self._locator = locator
+        self._can_lock = can_lock
+        self._locked = locked
         self._contacts, self._counts = contacts, counts
         rows = self._contact_rows_for(locked)
         # The maintenance actions close the list, after each contact, for each sort. First
@@ -153,6 +191,7 @@ class ContactsScreen(ContactListScreen):
             prefix_bytes=prefix_bytes,
             sort=sort,
             tail=tail,
+            key_hint=lambda value: "^L map" if self._marker_of(value) is not None else "",
         )
         if archived:
             self.short_title = f"Contacts · {known} + {archived}"
@@ -176,6 +215,62 @@ class ContactsScreen(ContactListScreen):
             )
         return rows
 
+    def _marker_of(self, value: object) -> MapMarker | None:
+        """The marker of the node of a row value, or ``None`` (a tail row, or no location)."""
+        if self._locator is None:
+            return None
+        if value == YOU:
+            return self._locator.you()
+        key = getattr(value, "public_key", None) or getattr(value, "key_prefix", None)
+        return self._locator.find(key) if isinstance(key, str) else None
+
+    def _highlighted_marker(self) -> MapMarker | None:
+        """The marker of the highlighted node, or ``None`` when ^L does nothing."""
+        current = self._current_choice()
+        return self._marker_of(current.value) if current is not None else None
+
+    def _lock_target(self) -> tuple[Contact, bool] | None:
+        """The contact that ^K locks or unlocks, and whether it is locked now.
+
+        ``None`` when ^K does nothing: on our node, on a row of the tail, on a contact with
+        no full key (the store attaches a lock to the full key), or when the caller cannot
+        store a lock.
+        """
+        current = self._current_choice()
+        if not self._can_lock or current is None:
+            return None
+        contact = current.value
+        key = (getattr(contact, "public_key", None) or "").lower().removeprefix("0x")
+        if contact == YOU or len(key) != 64:
+            return None
+        return contact, key in self._locked
+
+    @property
+    def footer_hint(self) -> str:
+        """The hint of the list, with ``^K lock`` or ``^K unlock`` where it has room for it."""
+        hint = super().footer_hint
+        target = self._lock_target()
+        if target is None:
+            return hint
+        return splice_if_room(hint, "^K unlock" if target[1] else "^K lock")
+
+    def handle(self, action: str, data: str = "") -> None:
+        """^L asks :func:`open_contacts` to open the map, and ^K to toggle the lock.
+
+        The list handles all other actions.
+        """
+        if action == "locate":
+            marker = self._highlighted_marker()
+            if marker is not None:
+                self.resolve(KeyRequest("locate", marker))
+            return
+        if action == "lock":
+            target = self._lock_target()
+            if target is not None:
+                self.resolve(KeyRequest("lock", target[0]))
+            return
+        super().handle(action, data)
+
     def refresh_locks(self, locked: frozenset[str]) -> None:
         """Draw the padlocks again in place, after a detail page can lock or unlock a contact.
 
@@ -184,7 +279,26 @@ class ContactsScreen(ContactListScreen):
         new screen. The highlight, the sort, the scroll, and a typed filter all stay where
         they were.
         """
+        self._locked = locked
         self.update_rows(self._contact_rows_for(locked))
+
+
+def _with_opp(slot, label: str, action: str, enabled: bool):  # noqa: ANN001, ANN202 - an FPair
+    """``slot`` (an F-key slot, or ``None``) with ``label`` and ``action`` as its Shift half.
+
+    The plain half stays as the list gave it: ``Sect ↑`` or ``Sect ↓`` when the list has
+    sections, or an empty half when it has none.
+    """
+    from .tui.fkeys import FPair
+
+    return FPair(
+        slot.label if slot else "",
+        slot.action if slot else "",
+        label,
+        action,
+        enabled=slot.enabled if slot else False,
+        opp_enabled=enabled,
+    )
 
 
 async def open_contacts(
@@ -196,7 +310,7 @@ async def open_contacts(
     counts: dict[str, int],
     sort: ContactsSort,
 ) -> None:
-    """Open the interactive contacts list. Enter opens Node detail, and Esc leaves.
+    """Open the interactive contacts list. Enter opens Node detail, ^L the map, and Esc leaves.
 
     The list stays pushed for the whole visit. Thus the detail page of the node that Enter
     selects, the archive flow, and the archived list (the tail actions open the last two)
@@ -224,12 +338,14 @@ async def open_contacts(
         RuntimeError: If the caller is outside the interactive menu (no full-screen
             session).
     """
+    from .map_screen import Locator
     from .node_detail_screen import open_node_detail
     from .surface import TuiUi
 
     if not isinstance(ctx.ui, TuiUi):  # pragma: no cover - the caller is for the menu only
         raise RuntimeError("the interactive contacts list is only available in the menu")
     session = ctx.ui.session
+    locator = await Locator.gather(ctx)
 
     def build() -> ContactsScreen:
         """The screen over the current contacts, with the live archived count on its tail."""
@@ -242,6 +358,8 @@ async def open_contacts(
             sort,
             archived=_archived_count(ctx, self_key),
             locked=_locked_keys(ctx, self_key),
+            locator=locator,
+            can_lock=_can_lock(ctx, self_key),
         )
 
     screen = build()
@@ -252,6 +370,18 @@ async def open_contacts(
                 chosen = await visit.result()
                 if chosen is CANCEL or chosen is None:  # Esc
                     return
+                if isinstance(chosen, KeyRequest) and chosen.action == "lock":
+                    # ^K: no confirm and no notice, as on the node page. The next ^K
+                    # reverses it, and the padlock that the row gains or loses is the
+                    # acknowledgement. The highlight, the sort, and the filter stay.
+                    _toggle_lock(ctx, self_key, chosen.value)
+                    screen.refresh_locks(_locked_keys(ctx, self_key))
+                    continue
+                if isinstance(chosen, KeyRequest):
+                    # ^L: the map goes on the stack above the list, and Esc on the map comes
+                    # back to the same row.
+                    await locator.show(chosen.value)
+                    continue
                 if chosen == _ARCHIVE:
                     # The archive ladder, its preview, and its confirm all float over the
                     # list, which is already the backdrop. A sweep that archived a contact
@@ -262,6 +392,9 @@ async def open_contacts(
                     if await archive_contacts(ctx, self_key):
                         rebuild = True
                         break
+                    # A sweep can lock contacts and archive none. Then the rows stay, and
+                    # only their padlocks are drawn again.
+                    screen.refresh_locks(_locked_keys(ctx, self_key))
                     continue
                 if chosen == _ARCHIVED:
                     # The archived list is a screen and not a section. It nests above this
@@ -286,6 +419,7 @@ async def open_contacts(
         if not rebuild:
             return
         contacts = await ctx.devstate.contacts()
+        locator = await Locator.gather(ctx)
         screen = build()
 
 
@@ -296,6 +430,19 @@ def _archived_count(ctx: AppContext, self_key: str) -> int:
     if store is None or not dev_pub:
         return 0
     return len(store.archived(dev_pub))
+
+
+def _can_lock(ctx: AppContext, self_key: str) -> bool:
+    """Whether a lock can be stored on this device: a contact store, and the key of the device."""
+    store = getattr(ctx, "contact_store", None)
+    return store is not None and bool((self_key or "").lower().removeprefix("0x"))
+
+
+def _toggle_lock(ctx: AppContext, self_key: str, contact: Contact) -> None:
+    """Lock ``contact`` on this device, or unlock it when it is locked (^K)."""
+    store = ctx.contact_store
+    dev_pub = self_key.lower().removeprefix("0x")
+    store.set_locked(dev_pub, contact, not store.is_locked(dev_pub, contact.public_key))
 
 
 def _locked_keys(ctx: AppContext, self_key: str) -> frozenset[str]:

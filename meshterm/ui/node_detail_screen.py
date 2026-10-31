@@ -23,7 +23,7 @@ screen is the node itself, in full:
     faint ``…`` marks at the edges, the same as a long path line scrolls on the Routes
     tab. Then, when the node has advertised a location, a static basemap preview (refer
     to :class:`~meshterm.ui.minimap.MiniMap`) centred on the node. The preview grows into
-    the rows of the viewport that remain.
+    the rows of the viewport that remain. A short frame (the Cardputer) does not show it.
 
     The actions of the tab: ``Open full map`` opens the full map, centred here, with its
     find filter set to this node, so the node is lit among the others. Then
@@ -43,7 +43,8 @@ screen is the node itself, in full:
     where the sweep archives. After a red confirm, it removes this node from the contact
     table of the device and from the contacts that MeshTerm remembers for the device.
     Then the page closes, because the contact that the page shows does not exist any
-    more. An archive and a restore also close the page. A lock does not.
+    more. An archive and a restore also close the page. A lock does not. A page that a
+    conversation opens has only the lock row of this group.
   * **Routes**: the routes on which the device really heard the node arrive. The shared
     route graph (:mod:`~meshterm.ui.pathgraph`) draws them from the node to our node, in
     the inbound direction of the packets: the contact on the left, our node on the right.
@@ -884,7 +885,7 @@ class NodeDetailScreen(Screen):
         if tab is not None:
             if tab.kind == "info":
                 budget = viewport - len(lines) - action_lines - 1  # the line of the rule
-                lines.extend(self._info_stage(width, budget))
+                lines.extend(self._info_stage(width, budget, short=short))
             else:
                 route_blocks = [
                     self._route_row_lines(route, i == self._row_index, width)
@@ -936,17 +937,18 @@ class NodeDetailScreen(Screen):
         self._scroll_total = max(1, len(lines))
         return lines
 
-    def _info_stage(self, width: int, budget: int) -> list[str]:
+    def _info_stage(self, width: int, budget: int, *, short: bool = False) -> list[str]:
         """The block of vitals and, with a fix, the location preview grown to fit.
 
         ``budget`` is the number of visible lines that remain for the full stage. The rows
         of vitals are never truncated. The preview changes its size instead: it takes the
-        lines that the vitals and its caption leave, up to ``_MAP_MAX_ROWS``. When that is
-        less than ``_MAP_MIN_ROWS``, the preview is not shown at all (a short frame keeps
-        its header and actions visible instead). Each row, but not the key, hangs under
-        itself when it wraps. The key keeps its one line and scrolls (refer to
-        :meth:`_key_line`). Thus the row count that sets the size of the preview cannot
-        change while the user scrolls through a long key.
+        lines that the vitals and its caption leave, between ``_MAP_MIN_ROWS`` and
+        ``_MAP_MAX_ROWS``. When the vitals leave less than the minimum, the preview keeps
+        its minimum and the page scrolls. On a ``short`` frame, the preview is not shown at
+        all, because its minimum alone pushes the header or the actions off the screen.
+        Each row, but not the key, hangs under itself when it wraps. The key keeps its one
+        line and scrolls (refer to :meth:`_key_line`). Thus the row count that sets the
+        size of the preview cannot change while the user scrolls through a long key.
         """
         lines: list[str] = [""] * tab_air()  # the space of the stage under the strip, if any
         for label, value in self._info_rows:
@@ -961,17 +963,16 @@ class NodeDetailScreen(Screen):
                     indent=_LABEL_LANE,
                 )
             )
-        if self._minimap is not None:
+        # A short frame has no rows for the preview. The 14 rows of the Cardputer leave it
+        # two, and its minimum pushes the identity header and the actions off the screen.
+        if self._minimap is not None and not short:
             caption = 1 if self._map_caption is not None else 0
             room = budget - len(lines) - 1 - caption  # minus the blank line above it
-            # Below its minimum, the preview is not shown. It does not push the identity
-            # header and the actions off a short frame (the 14 rows of the Cardputer leave
-            # it two).
-            if room >= _MAP_MIN_ROWS:
-                lines.append("")
-                lines.extend(self._minimap.render(width, min(_MAP_MAX_ROWS, room)))
-                if self._map_caption is not None:
-                    lines.extend(render_lines(self._map_caption, width, no_wrap=True))
+            rows = max(_MAP_MIN_ROWS, min(_MAP_MAX_ROWS, room))
+            lines.append("")
+            lines.extend(self._minimap.render(width, rows))
+            if self._map_caption is not None:
+                lines.extend(render_lines(self._map_caption, width, no_wrap=True))
         return lines
 
     def _key_line(self, label: str, value: Text, width: int) -> str:
@@ -1242,8 +1243,120 @@ def _located(lat: float | None, lon: float | None) -> bool:
 # -- data gathering + the action loop -----------------------------------------
 
 
+class ContactPages:
+    """The contacts whose node page a screen can open, and the page that opens on one of them.
+
+    This is the ^O key (``author_page``) of a conversation: the page of the node that wrote
+    the selected message. At each paint, the screen asks :meth:`find` for the contact of
+    the author. Thus its hint and its F-key lane name ^O only when the key acts. Then
+    :meth:`show` opens the page that the Contacts list opens for that contact. It is the
+    twin of :class:`~meshterm.ui.map_screen.Locator`, which ^L uses for the map.
+
+    The contacts come from the device one time, when the screen opens.
+
+    It is also the ^K key (``lock``) of a conversation: the lock of the author, which
+    :meth:`lock_state` reads and :meth:`set_locked` writes. The store keeps a lock under
+    the key of the device, so the pages hold that key too. The state is read from the store
+    at each paint and never kept here, because the node page can change it too.
+    """
+
+    def __init__(self, ctx: AppContext, contacts: list[Contact], *, self_key: str = "") -> None:
+        """Hold the contacts that :meth:`find` searches.
+
+        Args:
+            ctx: The shared application context (it must be in the interactive menu).
+            contacts: The contacts of the device.
+            self_key: The public key of the device (hex). The store keeps the locks under
+                it. With ``""``, no contact can be locked from here.
+        """
+        self._ctx = ctx
+        self._contacts = contacts
+        self._self_key = self_key
+        self._dev_pub = self_key.lower().removeprefix("0x")
+        # The result of each key that find() got. A screen asks at each paint, and the
+        # answer for one key does not change while the contacts stay the same.
+        self._found: dict[str, Contact | None] = {}
+
+    @classmethod
+    async def gather(cls, ctx: AppContext, *, self_key: str = "") -> ContactPages:
+        """The pages of the contacts that the device has now. With no contacts, nothing is found."""
+        try:
+            contacts = await ctx.devstate.contacts()
+        except Exception:  # noqa: BLE001 - with no contacts, ^O opens only our own page
+            contacts = []
+        return cls(ctx, list(contacts), self_key=self_key)
+
+    def find(self, key: str | None) -> Contact | None:
+        """The contact with ``key`` (a full key or a key prefix), or ``None``.
+
+        The rule is the same as the rule of the map (refer to
+        :meth:`~meshterm.ui.map_screen.Locator.find`). A key prefix finds the contact whose
+        full key starts with it, and a full key finds a contact that MeshTerm knows only by
+        its key prefix.
+        """
+        if not key:
+            return None
+        needle = key.lower().removeprefix("0x")
+        if needle not in self._found:
+            self._found[needle] = next(
+                (c for c in self._contacts if _same_key(c.public_key or c.key_prefix, needle)),
+                None,
+            )
+        return self._found[needle]
+
+    @property
+    def can_lock(self) -> bool:
+        """Whether a lock can be written from here at all: a store, and the key of the device."""
+        return getattr(self._ctx, "contact_store", None) is not None and bool(self._dev_pub)
+
+    def lock_state(self, contact: Contact | None) -> bool | None:
+        """Whether ``contact`` is locked, or ``None`` when it cannot have a lock.
+
+        A lock needs the full key of a live contact, as on the node page (refer to
+        :meth:`~meshterm.core.contact_store.ContactStore.set_locked`). An archived contact
+        has no lock, because the lock exists to keep a contact out of the archive.
+        """
+        if contact is None or not self.can_lock:
+            return None
+        key = (contact.public_key or "").lower().removeprefix("0x")
+        if len(key) != 64 or _is_archived(self._ctx, contact, self._self_key):
+            return None
+        return self._ctx.contact_store.is_locked(self._dev_pub, key)
+
+    def locked_keys(self) -> frozenset[str]:
+        """The full keys of the contacts locked on this device, or none where no lock is stored.
+
+        A conversation compares it at each paint, to draw again the sender chips that gained
+        or lost their padlock (refer to :class:`~meshterm.ui.chat.ChatScreen`).
+        """
+        if not self.can_lock:
+            return frozenset()
+        return self._ctx.contact_store.locked_keys(self._dev_pub)
+
+    def set_locked(self, contact: Contact, locked: bool) -> None:
+        """Lock or unlock ``contact``. The caller asked :meth:`lock_state` first."""
+        if self.can_lock:
+            self._ctx.contact_store.set_locked(self._dev_pub, contact, locked)
+
+    async def show(self, contact: Contact | None) -> None:
+        """Open the node page of ``contact``, or of our node when it is ``None``.
+
+        The page opens to look, not to manage (``manage=False``). The verbs that remove a
+        contact (archive, restore, delete) belong to the list that the contact is in, and a
+        conversation is not that list. The lock is the exception (``lock=True``): it removes
+        nothing, and a conversation can already toggle it with ^K (JP, 2026-10-19).
+        """
+        await open_node_detail(self._ctx, contact, manage=False, lock=True)
+
+
+def _same_key(contact_key: str | None, needle: str) -> bool:
+    """Whether the key of a contact and a lowercase key (or key prefix) name the same node."""
+    key = (contact_key or "").lower().removeprefix("0x")
+    return bool(key) and (key.startswith(needle) or needle.startswith(key))
+
+
 async def open_node_detail(
-    ctx: AppContext, contact: Contact | None, *, manage: bool = True
+    ctx: AppContext, contact: Contact | None, *, manage: bool = True, lock: bool | None = None
 ) -> bool:
     """Open the Node detail page for a contact (or our node) and run its action loop.
 
@@ -1275,6 +1388,11 @@ async def open_node_detail(
     is really in. They never belong to a page opened from a list that is about to act on
     all its rows together.
 
+    With ``lock``, a caller that does not manage still lets the page lock and unlock. A
+    conversation gives ``True`` (refer to :class:`ContactPages`): the lock removes nothing,
+    and the page that a chat opens is then the way to lock in a room, where the F-key lane
+    has no free chip for it.
+
     Args:
         ctx: The shared application context (the interactive TUI must be running).
         contact: The contact to show, or ``None`` for our node (a page of identity and
@@ -1283,6 +1401,8 @@ async def open_node_detail(
         manage: Whether to show the contact-management actions (lock, archive, restore,
             delete). ``False`` draws none of them, and then the page can only return
             ``False``.
+        lock: Whether to show ``Lock contact`` or ``Unlock contact``. ``None`` follows
+            ``manage``.
 
     Returns:
         ``True`` if the visit ended because the user archived, restored, or deleted the
@@ -1338,7 +1458,7 @@ async def open_node_detail(
     except Exception:  # noqa: BLE001 - optional reads. Safe defaults keep the page working.
         prefix_bytes, width_bytes = 0, 1
 
-    stored_names = ctx.repo.node_names()
+    stored_names, named_at = ctx.repo.node_names_with_times()
     # One resolver from hash to name for the full page. The route list and the route graph
     # all name their hops through it (the contacts first, then the history of the recorder).
     resolve = make_node_resolver(contacts, stored_names)
@@ -1491,7 +1611,7 @@ async def open_node_detail(
             width_bytes,
             resolve=resolve,
             type_of=make_node_type_resolver(contacts),
-            key_of=make_name_key_resolver(contacts, stored_names),
+            key_of=make_name_key_resolver(contacts, stored_names, heard=named_at),
             style=route_graph_style,
             self_name=self_name,
             node_label=label,
@@ -1526,48 +1646,32 @@ async def open_node_detail(
         info_actions.append(_Action("regions", "🔖", "", "Ask which regions it carries"))
     # -- contact management: the last group of the page, and the only actions that end the
     # visit. None of them shows when the caller opened the page to look, not to act (refer
-    # to ``manage``). They never show for our node, or for a contact with no key at
-    # all, because the write has nothing to use as its address.
-    archived = manage and _is_archived(ctx, contact, self_key)
-    manageable = (
-        manage
-        and not you
-        and contact is not None
-        and bool(contact.public_key or contact.key_prefix)
-    )
+    # to ``manage``), except the lock when the caller lets the page lock (refer to
+    # ``lock``). They never show for our node, or for a contact with no key at all,
+    # because the write has nothing to use as its address.
+    may_lock = manage if lock is None else lock
+    archived = (manage or may_lock) and _is_archived(ctx, contact, self_key)
+    keyed = not you and contact is not None and bool(contact.public_key or contact.key_prefix)
+    manageable = manage and keyed
     store = getattr(ctx, "contact_store", None)
     dev_pub = self_key.lower().removeprefix("0x")
     whole_key = contact is not None and len(contact.public_key.lower().removeprefix("0x")) == 64
     # A lock is a mark of MeshTerm itself, attached to the full key in the contact store, and
     # only a live contact can have one. Its purpose is to keep a contact out of the archive.
-    lockable = manageable and not archived and whole_key and store is not None and bool(dev_pub)
+    lockable = (
+        may_lock and keyed and not archived and whole_key and store is not None and bool(dev_pub)
+    )
     base_actions = list(info_actions)
 
     def management(locked: bool) -> list[_Action]:
         """The action rows of the page, with the management group for this lock state last."""
-        rows = list(base_actions)
-        if not manageable:
-            return rows
-        # The lock is first. It changes nothing on the device and ends nothing, so it is
-        # the safest row of the group for the highlight. Then the constructive verb, then
-        # the destructive verb. Thus a key press by mistake most probably goes to the row
-        # that the user can undo. Archive and restore are the two halves of one move that
-        # the user can reverse. They use the ``💾``/``📂`` pair that the lexicon already
-        # gives to "put away" and "bring back". Only a contact with a full key can be
-        # written back to the device. Thus a contact with only a key prefix never gets the
-        # archive, because the archive leaves it with no way back. A locked contact
-        # never gets the archive at all, and that is the purpose of the lock.
-        if lockable:
-            if locked:
-                rows.append(_Action("unlock", "🔓", "", "Unlock contact"))
-            else:
-                rows.append(_Action("lock", "🔒", "", "Lock contact"))
-        if archived:
-            rows.append(_Action("restore", "📂", "ok", "Restore to device"))
-        elif whole_key and not locked:
-            rows.append(_Action("archive", "💾", "", "Archive contact"))
-        rows.append(_Action("remove", "🗑", "err", "Delete contact…"))
-        return rows
+        return base_actions + _management_rows(
+            locked=locked,
+            lockable=lockable,
+            manageable=manageable,
+            archived=archived,
+            whole_key=whole_key,
+        )
 
     locked = bool(lockable and store.is_locked(dev_pub, contact.public_key))
     info_actions = management(locked)
@@ -1677,6 +1781,47 @@ async def open_node_detail(
         # of the list below, exactly as the full map does when it closes.
         session.request_full_repaint()
     return contact_removed
+
+
+def _management_rows(
+    *, locked: bool, lockable: bool, manageable: bool, archived: bool, whole_key: bool
+) -> list[_Action]:
+    """The contact-management group of the node page, for one lock state.
+
+    The lock is first. It changes nothing on the device and ends nothing, so it is the
+    safest row of the group for the highlight. Then the constructive verb, then the
+    destructive verb. Thus a key press by mistake most probably goes to the row that the
+    user can undo. Archive and restore are the two halves of one move that the user can
+    reverse. They use the ``💾``/``📂`` pair that the lexicon already gives to "put away"
+    and "bring back". Only a contact with a full key can be written back to the device.
+    Thus a contact with only a key prefix never gets the archive, because the archive
+    leaves it with no way back. A locked contact never gets the archive at all, and that
+    is the purpose of the lock.
+
+    A page that may lock but not manage (a page that a conversation opens) has only the
+    lock row.
+
+    Args:
+        locked: Whether the contact is locked now.
+        lockable: Whether the page shows the lock row.
+        manageable: Whether the page shows archive, restore, and delete.
+        archived: Whether the contact is archived. Then restore takes the place of archive.
+        whole_key: Whether the full key of the contact is known, which an archive must have.
+    """
+    rows: list[_Action] = []
+    if lockable:
+        if locked:
+            rows.append(_Action("unlock", "🔓", "", "Unlock contact"))
+        else:
+            rows.append(_Action("lock", "🔒", "", "Lock contact"))
+    if not manageable:
+        return rows
+    if archived:
+        rows.append(_Action("restore", "📂", "ok", "Restore to device"))
+    elif whole_key and not locked:
+        rows.append(_Action("archive", "💾", "", "Archive contact"))
+    rows.append(_Action("remove", "🗑", "err", "Delete contact…"))
+    return rows
 
 
 def _is_archived(ctx: AppContext, contact: Contact | None, self_key: str) -> bool:

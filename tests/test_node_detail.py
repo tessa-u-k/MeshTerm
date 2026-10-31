@@ -153,9 +153,9 @@ def test_tab_strip_bottom_is_a_continuous_rule_notched_at_the_active_tab() -> No
     # (west and north, ╯) into "Routes". It is blank across the width of "Routes" (open into
     # the page). Then it goes down again (north and east, ╰) and continues.
     assert bot.plain == "────────╯          ╰"
-    # It is one continuous line: each cell has the accent, the colour of the active tab. The
-    # colours are not mixed.
-    assert {r.style for r in bot.spans} == {"accent"}
+    # It is one continuous line: each cell has the grey of the border, the colour of the
+    # active tab. The colours are not mixed.
+    assert {r.style for r in bot.spans} == {"border"}
 
     _, _, bot_first = tab_strip(["Map", "Routes"], 0, width=20).renderables
     assert bot_first.plain == "╯       ╰───────────"  # the notch is now under the first tab
@@ -621,7 +621,7 @@ def test_located_accepts_real_fixes_and_rejects_junk() -> None:
 
 
 def _header() -> Text:
-    header = Text("▲ ", style="#a78bfa")
+    header = Text("▲ ", style="type.repeater")
     header.append("Hub", style="accent")
     header.append("   repeater", style="muted")
     return header
@@ -1369,6 +1369,39 @@ def test_node_detail_screen_tabs_switch_the_stage() -> None:
     assert screen.picocalc_lyra_lane[2].label == "Info"
 
 
+def test_node_detail_preview_keeps_its_minimum_except_on_a_short_frame() -> None:
+    """The preview shows at its minimum when the actions leave less. A short frame has none.
+
+    A contact page has many action rows, so on a terminal of 24 rows they leave the preview
+    less than its minimum. The preview keeps its minimum and the page scrolls. The 11-row
+    viewport of the Cardputer is a short frame, and there the preview is not shown.
+    """
+    mini = MiniMap(
+        _FakeSession(),
+        _OfflineSource(),
+        14,
+        center_lat=45.5,
+        center_lon=-73.6,
+        zoom=13,
+        markers=[MapMarker(label="Hub", lat=45.5, lon=-73.6, key="3d63aa")],
+    )
+    actions = [_Action(f"a{i}", "⚙", "", f"Action {i}") for i in range(8)]
+    screen = _screen(
+        minimap=mini,
+        map_caption=Text("Hub · centred here", style="faint"),
+        info_actions=actions,
+    )
+    screen.note_viewport(21)
+    body = _plain(screen.render_body(72)).splitlines()
+    caption = next(i for i, line in enumerate(body) if "centred here" in line)
+    vitals = next(i for i, line in enumerate(body) if line.startswith("packets"))
+    assert caption - vitals - 2 >= 5  # the rows between the blank line and the caption
+    assert len(body) > 21  # the preview did not shrink under its minimum: the page scrolls
+
+    screen.note_viewport(11)
+    assert "centred here" not in _plain(screen.render_body(53))
+
+
 def test_node_detail_single_tab_hides_the_switch_hint() -> None:
     """A page with only one tab does not have the ←→ tab atom in its footer."""
     screen = _screen(tabs=[_Tab("Info", "info")])  # our node: no Routes tab
@@ -1427,3 +1460,64 @@ def test_routes_legend_steps_aside_on_a_short_frame() -> None:
 
     assert "▲ repeater" in stage(22)  # the body of the PicoCalc
     assert "▲ repeater" not in stage(11)  # the body of the Cardputer
+
+
+def test_a_page_that_may_only_lock_shows_only_the_lock_row() -> None:
+    """The management group of a page that a conversation opens is only Lock or Unlock.
+
+    Archive, restore, and delete belong to the list that the contact is in. A lock removes
+    nothing, so a conversation can offer it (JP, 2026-10-19). A page that manages keeps its
+    full group, in the same order as before.
+    """
+    from meshterm.ui.node_detail_screen import _management_rows
+
+    def keys(**state: bool) -> list[str]:
+        base = {"locked": False, "lockable": True, "manageable": False, "archived": False}
+        return [row.key for row in _management_rows(**{**base, **state}, whole_key=True)]
+
+    assert keys() == ["lock"]
+    assert keys(locked=True) == ["unlock"]
+    assert keys(lockable=False) == []
+    assert keys(manageable=True) == ["lock", "archive", "remove"]
+    assert keys(manageable=True, locked=True) == ["unlock", "remove"]
+    assert keys(manageable=True, lockable=False, archived=True) == ["restore", "remove"]
+
+
+async def test_a_conversation_opens_the_author_page_with_its_lock_row(monkeypatch) -> None:  # noqa: ANN001
+    """^O in a conversation opens the page to look, with the lock as its only verb."""
+    import meshterm.ui.node_detail_screen as nd
+
+    calls: list[tuple] = []
+
+    async def _fake(ctx, contact, *, manage=True, lock=None):  # noqa: ANN001, ANN202
+        calls.append((contact, manage, lock))
+        return False
+
+    monkeypatch.setattr(nd, "open_node_detail", _fake)
+    await nd.ContactPages(None, []).show(None)  # type: ignore[arg-type]
+    assert calls == [(None, False, True)]
+
+
+def test_contact_pages_read_and_write_the_lock_of_a_live_contact(tmp_path) -> None:  # noqa: ANN001
+    """The pages lock a contact with a full key, and nothing without a store or a device key."""
+    from meshterm.core.contact_store import ContactStore
+    from meshterm.ui.node_detail_screen import ContactPages
+
+    store = ContactStore(tmp_path / "contacts.json")
+    dev = "cc" * 32
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+    prefix_only = Contact(name="Bob", public_key="", key_prefix="b2" * 6)
+    pages = ContactPages(SimpleNamespace(contact_store=store), [alice], self_key=dev)  # type: ignore[arg-type]
+    assert pages.can_lock
+    assert pages.lock_state(alice) is False
+    pages.set_locked(alice, True)
+    assert pages.lock_state(alice) is True and store.is_locked(dev, "a1" * 32)
+    assert pages.lock_state(prefix_only) is None
+
+    # An archived contact has no lock: the lock exists to keep a contact out of the archive.
+    store.set_locked(dev, alice, False)
+    store.archive(dev, alice, when=1_700_000_000)
+    assert pages.lock_state(alice) is None
+
+    assert ContactPages(SimpleNamespace(contact_store=store), [alice]).can_lock is False  # type: ignore[arg-type]
+    assert ContactPages(None, [alice], self_key=dev).can_lock is False  # type: ignore[arg-type]

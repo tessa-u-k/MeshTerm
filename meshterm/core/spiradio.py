@@ -31,7 +31,8 @@ device, not of a profile. Thus, if the user gets to the same radio from the pick
 and from a profile the next day, it is still the same node. The first time that a radio is
 used, MeshTerm copies the identity and the contacts of the bridge
 (:func:`import_bridge_state`). Thus a node that exists already keeps its key, and with
-the key its place in the contact lists of all the other nodes.
+the key its place in the contact lists of all the other nodes. An imported key goes into
+the same file (:meth:`SpiRadioDevice.import_private_key`).
 """
 
 from __future__ import annotations
@@ -48,9 +49,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .atomicwrite import write_atomically
 from .config import DeviceProfile, SpiWiring
 from .connection import DeviceCommandError, MeshCoreDevice
 from .discovery import TRANSPORT_SERIAL, DiscoveredDevice, spi_device
+from .privatekey import checked
 
 _log = logging.getLogger(__name__)
 
@@ -879,6 +882,8 @@ class SpiRadioDevice(MeshCoreDevice):
     new device) starts a new node.
     """
 
+    import_restarts = True
+
     def __init__(self, wiring: SpiWiring, state: Path, *, node_name: str = "MeshTerm") -> None:
         """Prepare the device. Nothing starts until :meth:`connect`.
 
@@ -931,6 +936,36 @@ class SpiRadioDevice(MeshCoreDevice):
             await super().disconnect()
         finally:
             await self._stop_node()
+
+    async def import_private_key(self, key_hex: str) -> None:
+        """Write the key into the node's ``identity.key``. The node uses it when it starts again.
+
+        The node of the radio library refuses an import over the companion protocol. It
+        answers "disabled", as a firmware does when its import is off. But the key of the
+        node is a file that MeshTerm keeps (refer to :mod:`~meshterm.core.radionode`), and
+        the node reads it only when it starts. Thus this method writes the file, and does
+        not send the command. The running node keeps its old identity until it stops. The
+        caller restarts it (:attr:`~meshterm.core.connection.Device.import_restarts`): the
+        menu announces a reconnect, which stops this node and starts a new one, and a run
+        on the command line stops the node when it ends.
+
+        The file gets the key in the form that the user gave. An imported seed stays a seed,
+        because the radio library keeps keys in that form, and a seed is the more complete
+        form (JP, 2026-10-13). A 64-byte key from a firmware companion has no seed, and the
+        library reads it in that form too.
+
+        The method does not restart the node itself. The services of the session subscribe
+        to the events of this connection, and a new connection under them would leave them
+        deaf. The reconnect of the session is the one path that rebuilds them.
+        """
+        try:
+            key = checked(bytes.fromhex(key_hex))
+        except ValueError as exc:
+            raise DeviceCommandError(str(exc)) from None
+        await asyncio.to_thread(
+            write_atomically, self._state / "identity.key", key, owner_only=True
+        )
+        _log.info("spi radio: wrote a new identity key for %s", self._wiring.spidev)
 
     async def _stop_node(self) -> None:
         """Stop the node, if one runs, and forget it."""

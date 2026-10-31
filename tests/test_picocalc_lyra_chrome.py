@@ -103,27 +103,27 @@ def test_the_clip_arrows_are_always_drawn_and_say_it_in_colour() -> None:
     The arrows once appeared and disappeared. A pair that was half shown left a blank cell
     for the missing arrow, and the user had to compare the row with a memory of the row
     (JP, 2026-08-31). Now the pair never moves and never changes width. An arrow for a
-    direction with more content has the accent colour of the border. An arrow for a
-    direction with no more content is muted. This is the live and dim language of the F-key
-    lane, one row up.
+    direction with more content is lit as the title is. An arrow for a direction with no
+    more content is ``faint``. This is the live and dim language of the F-key lane, one row
+    up.
     """
     hint = "↑↓ move · Esc back"
     assert _arrow_styles(_bar_text("Contacts", hint, above=True, below=True)) == (
-        "accent",
-        "accent",
+        "title.border",
+        "title.border",
     )
     assert _arrow_styles(_bar_text("Contacts", hint, above=False, below=True)) == (
-        "muted",
-        "accent",
+        "faint",
+        "title.border",
     )
     assert _arrow_styles(_bar_text("Contacts", hint, above=True, below=False)) == (
-        "accent",
-        "muted",
+        "title.border",
+        "faint",
     )
     # A body that fits keeps the pair, and both are dim. Nothing appears or disappears.
     assert _arrow_styles(_bar_text("Contacts", hint, above=False, below=False)) == (
-        "muted",
-        "muted",
+        "faint",
+        "faint",
     )
 
     widths = {
@@ -392,15 +392,15 @@ def test_map_locate_is_reachable_from_both_control_keys() -> None:
 
     Thus both Ctrl keys and F2 do the same action.
 
-    The letter is the mnemonic of the action: ^Y for "you". Thus it is the same chord on each
-    screen that can point to our node. It is not the initial of one screen.
+    The letter is the mnemonic of the action: ^L to locate. Thus it is the same chord on each
+    screen that can show a node on the map. It is not the initial of one screen.
     """
     from prompt_toolkit.keys import Keys
 
     from meshterm.ui.tui.session import _CTRL_LETTER_CHORDS, _KEY_ACTIONS
 
-    assert _CTRL_LETTER_CHORDS["y"] == "locate"  # the half for the right-Ctrl rescue
-    assert _KEY_ACTIONS[Keys.ControlY] == "locate"  # the ordinary binding, made from it
+    assert _CTRL_LETTER_CHORDS["l"] == "locate"  # the half for the right-Ctrl rescue
+    assert _KEY_ACTIONS[Keys.ControlL] == "locate"  # the ordinary binding, made from it
 
 
 def test_host_battery_reads_the_sysfs_supply(tmp_path, monkeypatch) -> None:
@@ -421,13 +421,13 @@ def test_host_battery_reads_the_sysfs_supply(tmp_path, monkeypatch) -> None:
     assert (reading.percent, reading.charging, reading.millivolts) == (53, False, 4012)
 
     (supply / "status").write_text("Charging\n")
+    asyncio.run(service._poll_host())  # a changed flag shows when a second read agrees
     asyncio.run(service._poll_host())
     assert service.reading().charging is True
 
     monkeypatch.setattr(battery_service, "_POWER_SUPPLIES", tmp_path / "gone")
-    for _ in range(battery_service._HOST_MISSES_KEPT + 1):
-        asyncio.run(service._poll_host())
-    assert service.reading() is None  # an unreadable supply is absent, so the header draws nothing
+    asyncio.run(service._poll_host())
+    assert service.reading() is None  # a supply that is gone is absent, so the header draws nothing
 
 
 def test_dialog_wrap_shrinks_on_picocalc() -> None:
@@ -500,7 +500,7 @@ def test_an_atom_the_lane_only_half_covers_stands() -> None:
     # The atom also describes the arrows, and no slot has them.
     assert strip_lane_atoms("↑↓ PgUp/PgDn scroll", DEFAULT_LANE) == "↑↓ PgUp/PgDn scroll"
     # A second key in the verb half keeps the whole atom (region/you of the map).
-    assert strip_lane_atoms("Home/^Y region/you", DEFAULT_LANE) == "Home/^Y region/you"
+    assert strip_lane_atoms("Home/^L region/you", DEFAULT_LANE) == "Home/^L region/you"
 
 
 def test_a_dimmed_chip_still_covers_its_atom() -> None:

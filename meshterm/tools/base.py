@@ -16,6 +16,13 @@ from typing import TYPE_CHECKING, Any
 
 from ..core import exitcodes
 
+# The wrapper for a secret parameter, and its reader. They live with the other rules that
+# keep secrets out of the logs (refer to meshterm.core.secrets). The tools import them
+# from here, next to Tool and ToolResult.
+from ..core.secrets import Secret as Secret
+from ..core.secrets import loggable
+from ..core.secrets import reveal as reveal
+
 if TYPE_CHECKING:  # do not import typer or the context at module load, for a fast start
     import typer
 
@@ -168,7 +175,9 @@ class Tool(ABC):
         from ..core.selection import DeviceSelectionError
 
         run_id = ctx.repo.start_run(self.name, params, ctx.profile_name)
-        ctx.log.debug("run %s start: tool=%s params=%s", run_id, self.name, params)
+        # The copy with each secret hidden: a password, a channel secret, or a PIN in the
+        # parameters must never reach the log (refer to meshterm.core.secrets).
+        ctx.log.debug("run %s start: tool=%s params=%s", run_id, self.name, loggable(params))
         try:
             result = await self.run(ctx, {**params, "_run_id": run_id})
         except (

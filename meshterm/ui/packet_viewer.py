@@ -42,9 +42,9 @@ packet, and Home from anywhere, go to the **pin**. On the pin, the viewer holds 
 position instead of a packet. Thus each new packet becomes the card that the user reads,
 and the title says ``following`` instead of ``n/total``. ``↓`` steps off the pin onto
 the packet that shows at that moment. That packet then moves down the list as newer
-packets arrive. Thus a user who opened a packet to read it keeps it, and a user who
-walked up to the top gets the stream. These are the same two stops, with the same keys,
-as the feed under the dialog.
+packets arrive. The viewer opens on the stop that the list had (``pinned``). Thus a user
+who opened a packet to read it keeps it, and a user who watched the stream continues to
+watch it. These are the same two stops, with the same keys, as the feed under the dialog.
 """
 
 from __future__ import annotations
@@ -65,19 +65,22 @@ from ..services.trace_runner import NodeResolver
 from .marks import SELF_MARK, UNKNOWN_MARK
 from .menus import SEP_COMPACT, SEP_ROOMY
 from .pathgraph import PathLayer, render_path_graph, revisited_hops
-from .pathline import PathLine, hops_atom, path_line
+from .pathline import PathHop, PathLine, hops_atom, path_line
 from .theme import glyph, name_style, snr_style
 from .trace_screen import snr_bar
 from .tui.render import render_lines, render_to_ansi
 from .tui.screen import Screen
 from .widgets import (
     DEFAULT_GLYPH,
+    DESTINATION,
     NODE_GLYPHS,
+    ORIGIN,
     NameKeyResolver,
     TypeOf,
     age_seconds,
     format_ago,
     highlighted_hash,
+    hop_chip,
     node_type_legend,
     revisit_note,
     route_graph_style,
@@ -465,6 +468,7 @@ class PacketViewer(Screen):
         self_name: str | None = None,
         on_navigate: Callable[[PacketEntry], None] | None = None,
         on_pin: Callable[[], None] | None = None,
+        pinned: bool = False,
         channels: Sequence[tuple[str, bytes]] = (),
         source: Callable[[], Sequence[PacketEntry]] | None = None,
         type_of: TypeOf | None = None,
@@ -486,6 +490,10 @@ class PacketViewer(Screen):
                 same stop (the live feed) can also follow the stream, and still follows it
                 when the dialog closes. It is never called without a ``source``, because
                 the pin is a stop only where the list is live.
+            pinned: Whether to open on the pin instead of on the packet at ``index``.
+                The live feed gives its own stop here, so the viewer follows the stream
+                when the feed did. The open does not call ``on_pin``, because the list is
+                already on the pin. Without a ``source``, the viewer ignores this value.
             channels: The configured channels of the device, as ``(name, secret)``
                 pairs. The viewer tries them on the channel-text packet of an overheard
                 ``packet`` entry (refer to
@@ -532,18 +540,19 @@ class PacketViewer(Screen):
         self._key_of = key_of
         self._scope_of: ScopeOf = scope_of or unnamed_scope
         self._message_scope = message_scope
-        #: The packet that shows now, followed by identity. Thus a live prepend to the
-        #: source (which moves each index) never moves the viewer onto another packet.
-        self._current: PacketEntry | None = self._entries[self._index] if self._entries else None
         #: Whether the viewer is on the pin: the stop above the newest packet, which
         #: holds the top position instead of a packet. It means that ``_index == 0``. The
         #: pin is a mode on the newest entry, so all the code that reads the viewer (the
         #: card, the scroll, the cache) needs no special case. Only the title and the
-        #: moves are different. An open never goes to the pin, because Enter selected
-        #: this packet (refer to
-        #: :meth:`~meshterm.ui.livefeed_screen.LiveFeedScreen._open_packet`). Thus the
-        #: user walks up to the stream on purpose, or not at all.
-        self._pinned = False
+        #: moves are different. An open goes to the pin only when the list was on its own
+        #: pin (refer to
+        #: :meth:`~meshterm.ui.livefeed_screen.LiveFeedScreen._open_packet`).
+        self._pinned = pinned and self._can_pin and bool(self._entries)
+        if self._pinned:
+            self._index = 0
+        #: The packet that shows now, followed by identity. Thus a live prepend to the
+        #: source (which moves each index) never moves the viewer onto another packet.
+        self._current: PacketEntry | None = self._entries[self._index] if self._entries else None
         self._update_footer()
         self._set_title()
 
@@ -837,7 +846,13 @@ class PacketViewer(Screen):
             glyph, glyph_style = self._node_marker(entry, style)
             who.append(glyph, style=glyph_style)
             who.append(" ")
-            who.append(label, style=style)
+            if style == "muted":  # a bare hash: no name to put in a chip
+                who.append(label, style=style)
+            else:
+                # The node that sent the packet is the origin of its route. Thus it is a chip
+                # that closes on the point, and the ``via`` row continues that route.
+                hop = PathHop(label, you=True) if style == "you" else PathHop(label, key=entry.node)
+                who.append_text(hop_chip(hop, role=ORIGIN))
             if entry.node and label != entry.node:
                 who.append("  ")
                 who.append_text(highlighted_hash(entry.node, self._prefix_bytes))
@@ -1140,10 +1155,10 @@ class PacketViewer(Screen):
         rows: list[tuple[str, RenderableType]] = []
         dest = raw.get("dest_hash")
         if dest:
-            rows.append(("to", self._endpoint(dest)))
+            rows.append(("to", self._endpoint(dest, DESTINATION)))
         src = raw.get("src_key") or raw.get("src_hash")
         if src:
-            rows.append(("from", self._endpoint(src)))
+            rows.append(("from", self._endpoint(src, ORIGIN)))
         if raw.get("trace_tag"):
             rows.append(("tag", Text(raw["trace_tag"], style="muted")))
         readings = raw.get("trace_snrs")
@@ -1178,22 +1193,26 @@ class PacketViewer(Screen):
             line.append(f"{value:+.2f} dB", style=snr_style(value))
         return line
 
-    def _endpoint(self, value: str) -> Text:
+    def _endpoint(self, value: str, role: str) -> Text:
         """One end of an addressed packet: its resolved name, then the key that named it.
 
         This is the presentation of the ``from`` row, without the node-type glyph: a
         one-byte hash is too weak an identity for a type mark. A node that we cannot name
         shows only the hash, all grey (``known=False``), as each unknown-node hash in the
         app does.
+
+        A name is a chip at its end of the route (``role``). The sender closes on the point
+        and the recipient opens on the notch. The ``via`` row opens and closes on both,
+        because it is the middle (refer to :meth:`_via_path`). Thus the shape of each chip
+        shows which part of the one route its row names.
         """
         text = Text()
         named = self._resolve(value)
         known = bool(named and named != value)
         if known:
-            style = (
-                "you" if self._self_name and named == self._self_name else name_style(named, value)
-            )
-            text.append(named, style=style)
+            ours = bool(self._self_name and named == self._self_name)
+            hop = PathHop(named, you=True) if ours else PathHop(named, key=value)
+            text.append_text(hop_chip(hop, role=role))
             text.append("  ")
         text.append_text(highlighted_hash(value, self._prefix_bytes or 1, known=known))
         return text

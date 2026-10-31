@@ -23,6 +23,7 @@ from meshterm.core.models import (
     ChatMessage,
     Contact,
     Conversation,
+    MapMarker,
     Message,
     conversation_key,
 )
@@ -414,6 +415,21 @@ def _keys_of(mapping: dict[str, str]):
     return lambda name: mapping.get(name.casefold())
 
 
+#: The public key of our node in the tests of our chat chip.
+_OUR_KEY = "5e" + "7f" * 31
+
+
+def _ink(text, run: str) -> str:
+    """The style that colours ``run`` in ``text``: its identity span, not the path line's stamp."""
+    from meshterm.ui.pathline import PATH_INK
+
+    return next(
+        str(s.style)
+        for s in text.spans
+        if text.plain[s.start : s.end] == run and str(s.style) != PATH_INK
+    )
+
+
 def test_preview_prefixes_own_messages_only() -> None:
     """Only an outbound message gets a ``you:`` prefix. Inbound text shows exactly as it is.
 
@@ -426,7 +442,9 @@ def test_preview_prefixes_own_messages_only() -> None:
     dm_in = ChatMessage(text="hey", peer="aa", peer_name="Bob")
     assert _preview_text(dm_in, _NO_KEYS).plain == "hey"
     mine = ChatMessage(text="yo", outbound=True, is_channel=True, channel_idx=0)
-    assert _preview_text(mine, _NO_KEYS).plain == "you: yo"
+    assert _preview_text(mine, _NO_KEYS).plain == "you: yo"  # our node with no name
+    # With our name, the preview shows our chat chip: a padded block in reverse video.
+    assert _preview_text(mine, _NO_KEYS, us=("Me", _OUR_KEY)).plain == " ★ Me  yo"
 
 
 def test_preview_colours_channel_sender_and_mentions() -> None:
@@ -445,6 +463,31 @@ def test_preview_colours_channel_sender_and_mentions() -> None:
     # The @Zed that does not resolve takes the unknown-node grey, as each name with no place.
     zed = preview.plain.index("@Zed")
     assert any(s.style == "node.unknown" and s.start <= zed < s.end for s in preview.spans)
+
+
+def test_preview_draws_the_author_and_the_mentions_as_the_transcript_does(powerline) -> None:
+    """With chips, the author closes on the point and a mention opens on the notch.
+
+    The point says what the colon said, so the chip has no colon, and a mention chip has
+    no ``@``. Our own author is ``★ Name``, as the sender chip of our messages in the
+    transcript. A mention of our name has no star. With no name for our node, the bare
+    ``★`` stays.
+    """
+    from meshterm.ui.pathline import POWERLINE_ROUND_CLOSE, POWERLINE_ROUND_OPEN, POWERLINE_SEP
+
+    powerline(True)
+    theirs = ChatMessage(text="Bob: hi @[Alice]", is_channel=True, channel_idx=0)
+    author = POWERLINE_ROUND_OPEN + " Bob " + POWERLINE_SEP
+    mention = POWERLINE_SEP + " Alice " + POWERLINE_ROUND_CLOSE
+    assert _preview_text(theirs, _NO_KEYS).plain == f"{author} hi {mention}"
+    mine = ChatMessage(text="yo", outbound=True, is_channel=True, channel_idx=0)
+    assert _preview_text(mine, _NO_KEYS).plain == f"{POWERLINE_ROUND_OPEN} ★ {POWERLINE_SEP} yo"
+    us = ("Me", _OUR_KEY)
+    ours = f"{POWERLINE_ROUND_OPEN} ★ Me {POWERLINE_SEP} yo"
+    assert _preview_text(mine, _NO_KEYS, us=us).plain == ours
+    named = ChatMessage(text="Bob: hi @[Me]", is_channel=True, channel_idx=0)
+    me = POWERLINE_SEP + " Me " + POWERLINE_ROUND_CLOSE
+    assert _preview_text(named, _NO_KEYS, us=us).plain == f"{author} hi {me}"
 
 
 def test_preview_keeps_the_whole_message() -> None:
@@ -522,7 +565,8 @@ def test_title_contact_dot_reflects_conversation_history(repo: Repository) -> No
     """The contact dot of the title shows if there is history with the contact.
 
     The dot is filled (●) after the user and the contact talked, and hollow (○) before. It
-    is companion pink in both cases. The name has the hue of the key of the contact.
+    has the colour of the companion mark in both cases. The name has the hue of the key of
+    the contact.
     """
     from meshterm.tools.chat import _COMPANION_DOT_STYLE
     from meshterm.ui.theme import node_style
@@ -532,23 +576,23 @@ def test_title_contact_dot_reflects_conversation_history(repo: Repository) -> No
         label="Alice", is_channel=False, contact=Contact(name="Alice", public_key="d4" + "0" * 62)
     )
 
-    def dot_is_pink(row) -> bool:
+    def dot_has_mark_colour(row) -> bool:
         return any(
             span.style == _COMPANION_DOT_STYLE and span.start == 0 and span.end == 1
             for span in row.spans
         )
 
-    # No history yet: a hollow ring in the standard companion pink.
+    # No history yet: a hollow ring in the colour of the companion mark.
     fresh = _title(ctx, contact, {}, _NO_KEYS, _lanes([contact]))
-    assert fresh.plain.startswith("○") and dot_is_pink(fresh)
+    assert fresh.plain.startswith("○") and dot_has_mark_colour(fresh)
     # The name lane has the hue of the key of Alice.
     name_at = fresh.plain.index("Alice")
     assert any(s.style == node_style("d4") and s.start <= name_at < s.end for s in fresh.spans)
 
-    # After the user and the contact exchange messages, the same pink dot is filled.
+    # After the user and the contact exchange messages, the same dot is filled.
     last = ChatMessage(text="hi", peer=contact.peer)
     talked = _title(ctx, contact, {contact.key: last}, _NO_KEYS, _lanes([contact]))
-    assert talked.plain.startswith("●") and dot_is_pink(talked)
+    assert talked.plain.startswith("●") and dot_has_mark_colour(talked)
 
 
 # -- chat service -------------------------------------------------------------
@@ -981,16 +1025,10 @@ def test_at_mention_renders_as_name_in_sender_hue() -> None:
 
     assert "@Alice" in text.plain  # the token with brackets became a bare mention
     assert "@[Alice]" not in text.plain and "[Alice]" not in text.plain
-    # The "@Alice" text has the hue of the key (the same hue that the header uses).
-    hue = screen._sender_style("Alice")
-    assert hue == node_style("60")  # the spectrum hue from the key of the sender
-    at = text.plain.index("@Alice")
-    hue_spans = [
-        s for s in text.spans if s.style == hue and s.start <= at and at + len("@Alice") <= s.end
-    ]
-    assert hue_spans
+    # The "@Alice" text has the spectrum hue of the key (the same hue that the header uses).
+    assert _ink(text, "@Alice") == node_style("60")
     # The unknown @Zed gets the unknown-node grey, because it has no key and no hue.
-    assert screen._sender_style("Zed") == "node.unknown"
+    assert _ink(text, "@Zed") == "node.unknown"
 
 
 def test_direct_chat_unknown_mention_stays_muted() -> None:
@@ -1018,13 +1056,14 @@ def test_direct_chat_unknown_mention_stays_muted() -> None:
         key_of=_keys_of({"alice": "60" + "0" * 62}),
     )
 
+    body = screen._render_mentions("@[Alice] and @[Zed]", selected=False)
     # A mention that resolves still lights in the hue of its own key…
-    assert screen._sender_style("Alice", mention=True) == node_style("60")
+    assert _ink(body, "@Alice") == node_style("60")
     # …but an unknown mention is grey. It does not get the hue (d4…) of the peer.
-    assert screen._sender_style("Zed", mention=True) == "node.unknown"
-    assert screen._sender_style("Zed", mention=True) != node_style("d4")
+    assert _ink(body, "@Zed") == "node.unknown"
     # The sender label keeps the fallback to the peer key (the behaviour is the same).
-    assert screen._sender_style("Zed") == node_style("d4")
+    inbound = ChatMessage(text="hi", peer="d4e5f6a7")
+    assert _ink(screen._group_header("Zed", inbound), "Zed") == node_style("d4")
 
 
 def test_direct_transcript_groups_under_sender_headers() -> None:
@@ -1084,14 +1123,14 @@ async def test_chat_fkey_lane_dims_retry_and_the_nav_slots() -> None:
     failed = ChatMessage(text="oops", outbound=True, peer="d4e5f6a7", acked=False)
     screen = _screen(_StubSession(), send=None, messages=[failed], resend=resend)
     assert all(pair.enabled for pair in screen.picocalc_lyra_lane[3:])  # the pager moves the pick
-    assert screen.picocalc_lyra_lane[2].opp_enabled is True  # F8 Retry: the message has no ack
+    assert screen.picocalc_lyra_lane[0].opp_enabled is True  # F6 Retry: the message has no ack
 
     screen.handle("retry")
     await asyncio.sleep(0)
     assert failed.acked is True
-    assert screen.picocalc_lyra_lane[2].opp_enabled is False  # acknowledged: nothing to retry
+    assert screen.picocalc_lyra_lane[0].opp_enabled is False  # acknowledged: nothing to retry
     assert (
-        screen.picocalc_lyra_lane[2].opp_label == "Retry"
+        screen.picocalc_lyra_lane[0].opp_label == "Retry"
     )  # dim, not removed: it is part of this screen
 
 
@@ -1106,7 +1145,7 @@ def test_chat_fkey_lane_speaks_the_transcript_and_drops_channel_retry() -> None:
     assert [pair.opp_label for pair in direct.picocalc_lyra_lane[3:]] == ["Latest", "Oldest"]
     assert [pair.opp_action for pair in direct.picocalc_lyra_lane[3:]] == ["ctrl_end", "ctrl_home"]
     assert [pair.label for pair in direct.picocalc_lyra_lane[3:]] == ["Page ↓", "Page ↑"]
-    assert direct.picocalc_lyra_lane[2].opp_label == "Retry"
+    assert direct.picocalc_lyra_lane[0].opp_label == "Retry"
 
     channel = ChatScreen(
         Conversation(label="#general", is_channel=True, channel_id="1"),
@@ -1117,8 +1156,8 @@ def test_chat_fkey_lane_speaks_the_transcript_and_drops_channel_retry() -> None:
     )
     # A channel message has no acknowledgement, so a retry is not possible here. The slot is
     # empty (it is not dim), and its key resolves to nothing.
-    assert channel.picocalc_lyra_lane[2].opp_label == ""
-    assert fkeys.PICOCALC_LYRA_DECK.action_for(channel.picocalc_lyra_lane, 8) is None
+    assert channel.picocalc_lyra_lane[0].opp_label == ""
+    assert fkeys.PICOCALC_LYRA_DECK.action_for(channel.picocalc_lyra_lane, 6) is None
 
 
 def test_chat_screen_up_picks_and_ctrl_end_returns_to_compose() -> None:
@@ -1166,12 +1205,20 @@ def test_channel_transcript_groups_by_sender() -> None:
             text="hello all", outbound=True, is_channel=True, channel_idx=0, created_at=at(9)
         ),
     ]
-    screen = ChatScreen(conv, messages, send=None, names={}, session=_StubSession())
+    screen = ChatScreen(
+        conv,
+        messages,
+        send=None,
+        names={},
+        session=_StubSession(),
+        self_name="Me",
+        self_key=_OUR_KEY,
+    )
     rendered = _strip_ansi("\n".join(screen._render_grouped(80)))
 
     assert rendered.count("Alice") == 1  # the two Alice messages share one header
-    # The header of our group is the ★ that a route uses for our end, not our name.
-    assert "Bob" in rendered and "★" in rendered
+    # The header of our group is our name after the ★ (JP, 2026-10-13), not the bare ★.
+    assert "Bob" in rendered and "★ Me" in rendered
     assert "hi" in rendered and "again" in rendered  # the bodies are there, without the prefix
     assert "Alice: hi" not in rendered  # the raw name prefix moved into the header
     # Each message keeps its own timestamp on its line, also when grouped under one sender.
@@ -1181,9 +1228,16 @@ def test_channel_transcript_groups_by_sender() -> None:
     assert stamps[0] != stamps[1]  # the grouped Alice messages show different times
 
 
-def test_transcript_inscribes_the_sender_label_but_never_a_mention(powerline) -> None:
-    """The name that opens a group is a chip. The same name in a body is prose."""
-    from meshterm.ui.widgets import name_chip
+def test_transcript_draws_the_sender_as_an_origin_and_a_mention_as_a_destination(
+    powerline,
+) -> None:
+    """The sender chip closes on the point, and a mention chip opens on the notch.
+
+    A message goes from its author toward the node that it names. Thus the two chips are
+    the two ends of one route that is not drawn (JP, 2026-10-10).
+    """
+    from meshterm.ui.pathline import POWERLINE_SEP
+    from meshterm.ui.widgets import ORIGIN, mention_chip, name_chip
 
     powerline(True)  # this test is about the chip, so ask for a terminal that draws one
     conv = Conversation(label="#public", is_channel=True, channel_idx=0)
@@ -1193,11 +1247,35 @@ def test_transcript_inscribes_the_sender_label_but_never_a_mention(powerline) ->
     screen = ChatScreen(conv, messages, send=None, names={}, session=_StubSession())
     rendered = _strip_ansi("\n".join(screen._render_grouped(80)))
 
-    # The test builds the chip through the widget, not as literal text. The end caps are the
-    # caps of the path line, and the test asserts the framing, not the glyph.
-    assert name_chip("Alice").plain in rendered  # the header, as a chip
-    assert "@Bob" in rendered  # the mention, as the user typed it
-    assert name_chip("Bob").plain not in rendered  # …and not framed in the middle of a sentence
+    # The test builds the chips through the widget, not as literal text. The end caps are
+    # the caps of the path line, and the test asserts the framing, not the glyph.
+    sender = name_chip("Alice", role=ORIGIN).plain
+    mention = mention_chip("Bob", None).plain
+    assert "@" not in mention  # the chip says that it is a mention
+    assert sender.endswith(POWERLINE_SEP) and sender in rendered  # the header goes on
+    assert mention.startswith(POWERLINE_SEP) and mention in rendered  # the mention is reached
+    assert f"{mention} you around?" in rendered  # in its place in the sentence
+
+
+def test_a_mention_chip_moves_to_the_next_line_whole(powerline) -> None:
+    """The wrap breaks a body at a space, but never at a space inside a mention chip.
+
+    A chip has a pad at each side of its label, and a name can have spaces. Without the
+    hold, the notch stays at the end of one line and the name starts the next line.
+    """
+    from meshterm.ui.widgets import mention_chip
+
+    powerline(True)
+    conv = Conversation(label="#public", is_channel=True, channel_idx=0)
+    text = "Alice: the relay on the hill looks bad @[Bob Smith] you around?"
+    messages = [ChatMessage(text=text, is_channel=True, channel_idx=0)]
+    screen = ChatScreen(conv, messages, send=None, names={}, session=_StubSession())
+    mention = mention_chip("Bob Smith", None).plain
+
+    for width in range(30, 60):
+        lines = [_strip_ansi(line).rstrip() for line in screen._render_grouped(width)]
+        assert sum(mention.strip() in line for line in lines) == 1, width
+        assert all(cell_len(line) <= width for line in lines), width
 
 
 def test_unidentified_sender_takes_the_node_grey_not_the_chrome_grey() -> None:
@@ -1209,9 +1287,10 @@ def test_unidentified_sender_takes_the_node_grey_not_the_chrome_grey() -> None:
     """
     conv = Conversation(label="#public", is_channel=True, channel_idx=0)
     screen = ChatScreen(conv, [], send=None, names={}, session=_StubSession())
+    inbound = ChatMessage(text="hi", is_channel=True, channel_idx=0)
 
-    assert screen._sender_style("·") == "node.unknown"
-    assert screen._sender_style("nobody-knows-me") == "node.unknown"  # no key and no hue
+    for sender in ("·", "nobody-knows-me"):  # no prefix, and a name with no key and no hue
+        assert _ink(screen._group_header(sender, inbound), sender) == "node.unknown"
 
 
 def _two_day_messages():
@@ -1320,7 +1399,7 @@ async def test_chat_paths_key_needs_a_picked_message() -> None:
     await asyncio.sleep(0)
     assert shown == []
     assert "^P" not in screen.footer_hint
-    assert screen.picocalc_lyra_lane[2].enabled is False
+    assert screen.picocalc_lyra_lane[0].enabled is False
 
     screen.handle("up")
     screen.handle("up")  # select the older message
@@ -1331,7 +1410,7 @@ async def test_chat_paths_key_needs_a_picked_message() -> None:
     # direct chat has no reply to prepare. (The hint of a channel keeps the ^P atom beside
     # its Enter reply.)
     assert "Enter paths" in screen.footer_hint
-    assert screen.picocalc_lyra_lane[2].enabled is True
+    assert screen.picocalc_lyra_lane[0].enabled is True
 
 
 async def test_chat_direct_enter_on_a_pick_opens_paths() -> None:
@@ -1434,18 +1513,23 @@ def test_chat_channel_home_moves_the_compose_cursor() -> None:
 
 
 def test_channel_self_style_keyed_on_concept_not_label() -> None:
-    """Our white 'self' style depends on the message being outbound, not on the 'you' label.
+    """Our own chip depends on the message being outbound, not on the 'you' label.
 
     A remote sender with the name 'you' must not take the white style that is only for us.
     It reads as a normal sender (the hue of its key if the key resolves, and muted if not).
     """
     from meshterm.ui.theme import node_style
 
+    ours = ChatMessage(text="hi", is_channel=True, channel_idx=0, outbound=True)
+    theirs = ChatMessage(text="you: hi", is_channel=True, channel_idx=0)
+    mine = _channel_screen([], self_name="Me", self_key=_OUR_KEY)
+    white = _ink(mine._group_header("you", ours), " ★ Me ")  # our name, in white
+    assert white.startswith("bold #ffffff on ")
     screen = _channel_screen([])
-    assert screen._sender_style("you", is_self=True) == "you"  # us: white
-    assert screen._sender_style("you", is_self=False) == "node.unknown"  # no key: grey
+    assert _ink(screen._group_header("you", ours), "★") == "you"  # no name: the white star
+    assert _ink(screen._group_header("you", theirs), "you") == "node.unknown"  # no key: grey
     keyed = _channel_screen([], key_of=_keys_of({"you": "d4" + "0" * 62}))
-    remote = keyed._sender_style("you", is_self=False)
+    remote = _ink(keyed._group_header("you", theirs), "you")
     assert remote == node_style("d4")  # the spectrum hue of the key
 
 
@@ -1458,13 +1542,105 @@ def test_channel_own_messages_do_not_merge_with_remote_namesake() -> None:
         ChatMessage(text="you: impostor", is_channel=True, channel_idx=0, created_at=base),
         ChatMessage(text="mine", outbound=True, is_channel=True, channel_idx=0, created_at=base),
     ]
-    screen = _channel_screen(messages)
+    screen = _channel_screen(messages, self_name="Me", self_key=_OUR_KEY)
     rendered = _strip_ansi("\n".join(screen._render_grouped(80)))
-    # Two headers, and they are not only apart: theirs is the name that they sent, ours is the ★.
-    assert rendered.count("you") == 1 and rendered.count("★") == 1
+    # Two headers, and they are not only apart: theirs is the name that they sent, ours is
+    # our name after the ★.
+    assert rendered.count("you") == 1 and rendered.count("★ Me") == 1
 
 
-def _channel_screen(messages, session=None, key_of=None) -> ChatScreen:
+def test_a_blank_line_closes_each_author_where_the_rows_allow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """By default, a terminal of 24 rows or more puts a blank line after each author.
+
+    The blank line also comes before the divider of a new day, and never before the first
+    line. A terminal of fewer rows (the 14 of the Cardputer Zero) has no row to spare for
+    it. A second paint reads the cached lines, and the divider of the second day still pins
+    at its own line, not at the blank line before it. The two ends of the
+    ``section_spacing_min_rows`` preference ignore the rows, and a change applies at the
+    next paint.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from meshterm.core import preferences
+
+    base = datetime(2026, 7, 5, 14, 24, tzinfo=timezone.utc)
+
+    def at(minutes: int) -> datetime:
+        return base + timedelta(minutes=minutes)
+
+    def transcript() -> list[ChatMessage]:
+        return [
+            ChatMessage(text="Alice: hi", is_channel=True, channel_idx=0, created_at=at(0)),
+            ChatMessage(text="Alice: again", is_channel=True, channel_idx=0, created_at=at(1)),
+            ChatMessage(text="Bob: yo", is_channel=True, channel_idx=0, created_at=at(2)),
+            ChatMessage(text="Bob: later", is_channel=True, channel_idx=0, created_at=at(1440)),
+        ]
+
+    prefs = preferences.Preferences()
+    monkeypatch.setattr(preferences, "current", lambda: prefs)
+    screen = _channel_screen(transcript())
+    screen.note_terminal_rows(24)
+    lines = [_strip_ansi(line) for line in screen._render_grouped(53)]
+    assert lines[0].startswith("──") and lines[1] == "Alice"
+    assert lines[4] == "" and lines[5] == "Bob"  # after the two messages of Alice
+    assert lines[7] == "" and lines[8].startswith("── Mon")  # after Bob, before the new day
+    assert lines.count("") == 2
+    first = list(screen._sticky_headers)
+    screen._render_grouped(53)  # the cached lines
+    assert screen._sticky_headers == first and [at for at, _ in first] == [0, 8]
+
+    short = _channel_screen(transcript())
+    short.note_terminal_rows(14)
+    assert "" not in [_strip_ansi(line) for line in short._render_grouped(53)]
+
+    prefs.set("section_spacing_min_rows", 0)  # any height, also 14 rows
+    assert "" in [_strip_ansi(line) for line in short._render_grouped(53)]
+    prefs.set("section_spacing_min_rows", 10_000)  # never, and the cached lines change too
+    assert "" not in [_strip_ansi(line) for line in screen._render_grouped(53)]
+
+
+def test_a_mention_of_our_name_takes_our_chip_with_no_star(powerline) -> None:
+    """The chip of a mention of us is white, as our sender chip, but it has no star.
+
+    The mark of a message that names us is at the left of its time (refer to the next
+    test). With chips, no mention has its ``@``.
+    """
+    powerline(True)
+    screen = _channel_screen([], self_name="Me", self_key=_OUR_KEY)
+    text = screen._render_mentions("hi @[Me] and @[Bob]", selected=False)
+    assert "★" not in text.plain and "@" not in text.plain
+    me = next(s for s in text.spans if text.plain[s.start : s.end] == "Me")
+    assert str(me.style).startswith("bold #ffffff on ")  # the white label
+
+
+def test_a_message_that_names_us_has_the_mark_left_of_its_time() -> None:
+    """The mark goes in the two cells before the time, and each time moves two cells right.
+
+    The mark is a ``★`` in our hue (refer to the widget tests for its colour).
+    """
+    from datetime import datetime, timezone
+
+    at = datetime(2026, 7, 5, 14, 24, tzinfo=timezone.utc)
+    stamp = at.astimezone().strftime("%H:%M")
+    messages = [
+        ChatMessage(text="Bob: hi @[Me]", is_channel=True, channel_idx=0, created_at=at),
+        ChatMessage(text="Bob: hi @[Zed]", is_channel=True, channel_idx=0, created_at=at),
+    ]
+    screen = _channel_screen(messages, self_name="Me", self_key=_OUR_KEY)
+    rows = _strip_ansi("\n".join(screen._render_grouped(72))).splitlines()
+    assert any(row.startswith(f"  ★ {stamp}  hi") for row in rows)
+    assert any(row.startswith(f"    {stamp}  hi") for row in rows)  # the other message
+    screen.handle("up")
+    screen.handle("up")  # the first message: the pointer, then the mark
+    rows = _strip_ansi("\n".join(screen._render_grouped(72))).splitlines()
+    assert any(row.startswith(f"❯ ★ {stamp}  hi") for row in rows)
+
+
+def _channel_screen(
+    messages, session=None, key_of=None, self_name=None, self_key=None
+) -> ChatScreen:
     """Build a channel ChatScreen for ``messages``, for the selection and reply tests."""
     conv = Conversation(label="#public", is_channel=True, channel_idx=0)
     return ChatScreen(
@@ -1474,6 +1650,8 @@ def _channel_screen(messages, session=None, key_of=None) -> ChatScreen:
         names={},
         session=session or _StubSession(),
         key_of=key_of,
+        self_name=self_name,
+        self_key=self_key,
     )
 
 
@@ -1533,6 +1711,56 @@ def test_channel_enter_on_selection_primes_at_mention() -> None:
 
     assert screen._editor.text == "@[Alice] "
     assert screen._selected is None  # the focus returns to compose after the reply starts
+
+
+def test_each_reply_puts_its_mention_at_the_cursor() -> None:
+    """Two replies name two nodes in one message, each where the cursor was."""
+    screen = _channel_screen(_channel_messages())
+    for ch in "hi and":
+        screen.handle("text", ch)
+    screen.handle("ctrl_left")  # before "and"
+    screen.handle("up")  # Bob
+    screen.handle("enter")
+    assert screen._editor.text == "hi @[Bob] and"
+    screen.handle("end")
+    screen.handle("up")
+    screen.handle("up")  # Alice
+    screen.handle("enter")
+    assert screen._editor.text == "hi @[Bob] and @[Alice] "
+    assert screen._editor.cursor == len(screen._editor.text)
+    screen.handle("backspace")  # the space
+    screen.handle("backspace")  # all of the mention
+    assert screen._editor.text == "hi @[Bob] and "
+
+
+def test_the_compose_line_keeps_a_chip_whole_when_it_wraps(powerline) -> None:
+    """A chip in the compose line moves to the next line as one word, never split."""
+    from meshterm.ui.widgets import mention_chip
+
+    powerline(True)
+    screen = _channel_screen([])
+    for ch in "the relay on the hill looks bad @[Bob Smith] ok":
+        screen.handle("text", ch)
+    chip = mention_chip("Bob Smith", None).plain
+    for width in range(30, 60):
+        lines = _strip_ansi(screen.render_body(width)).splitlines()
+        assert sum(chip in line for line in lines) == 1, width
+
+
+def test_a_row_whose_last_message_names_us_has_the_mark_left_of_its_age(
+    repo: Repository,
+) -> None:
+    """The Messages list marks the row as the transcript marks the message."""
+    conv = Conversation(label="General", is_channel=True, channel_idx=0, channel_id="c0")
+    ctx = _RowCtx(repo)
+    us = ("Me", _OUR_KEY)
+    named = ChatMessage(text="Bob: hi @[Me]", is_channel=True, channel_id="c0")
+    other = ChatMessage(text="Bob: hi @[Zed]", is_channel=True, channel_id="c0")
+    lanes = _lanes([conv])
+    marked = _title(ctx, conv, {"chan:c0": named}, _NO_KEYS, lanes, us=us).plain
+    plain = _title(ctx, conv, {"chan:c0": other}, _NO_KEYS, lanes, us=us).plain
+    assert "★ now  " in marked and "★" not in plain
+    assert marked.index("now") == plain.index("now")  # the mark takes the cells of the gap
 
 
 def test_channel_typing_clears_selection() -> None:
@@ -1797,7 +2025,7 @@ async def test_picker_lists_companions_only(repo: Repository) -> None:
 async def test_picker_pins_its_column_header_over_the_group_heading(
     repo: Repository,
 ) -> None:
-    """On a page scrolled into Direct, the lane names stay at the top, over ``👤 Direct``."""
+    """On a page scrolled into Direct, the lane names stay at the top, over ``Direct``."""
     from types import SimpleNamespace
 
     from meshterm.tools.chat import ChatTool
@@ -1821,7 +2049,7 @@ async def test_picker_pins_its_column_header_over_the_group_heading(
     top = [ansi.sub("", row).strip() for row in visible[:2]]
     # Short words over a badge and an age, then the message.
     assert top[0].split() == ["CONVERSATION", "NEW", "LAST", "MESSAGE"]
-    assert top[1] == "── 👤 Direct ──"
+    assert top[1] == "── Direct ──"
     assert above is True
     # If the width is too small for the whole line, the last label gets shorter and does
     # not wrap. The lane has the size of these six-cell names, so this starts at a width
@@ -2298,29 +2526,16 @@ async def test_channel_slot_change_drops_the_cached_channel_list(repo: Repositor
     await device.disconnect()
 
 
-def test_chat_fkey_lane_steps_by_day_on_the_free_left_pair() -> None:
-    """The sections of the transcript are days, so F1 and F2 name the section step ``Day``.
+def test_chat_fkey_lane_has_no_day_jump() -> None:
+    """No chip sends the day jump: JP removed ``Day ↑`` and ``Day ↓`` (2026-10-10).
 
-    The keys and the actions are the same as ``Sect ↑`` and ``Sect ↓`` of a grouped select
-    list. The lane names what the sections are here. The chips are lit only if there is
-    more than one day to step between, as a list with one section has no section jump.
+    The desktop keeps the jump on ^PgUp and ^PgDn.
     """
     from datetime import timedelta
 
     from meshterm.core.models import utcnow
 
     now = utcnow()
-    one_day = [ChatMessage(text="hi", peer="d4e5f6a7", created_at=now)]
-    single = _screen(_StubSession(), send=None, messages=one_day)
-    assert [pair.label for pair in single.picocalc_lyra_lane[:2]] == ["Day ↑", "Day ↓"]
-    assert [pair.action for pair in single.picocalc_lyra_lane[:2]] == [
-        "ctrl_pageup",
-        "ctrl_pagedown",
-    ]
-    assert not any(
-        pair.enabled for pair in single.picocalc_lyra_lane[:2]
-    )  # one day: no place to step to
-
     spread = _screen(
         _StubSession(),
         send=None,
@@ -2329,12 +2544,57 @@ def test_chat_fkey_lane_steps_by_day_on_the_free_left_pair() -> None:
             ChatMessage(text="now", peer="d4e5f6a7", created_at=now),
         ],
     )
-    assert all(pair.enabled for pair in spread.picocalc_lyra_lane[:2])
-    # A left-hand pair rises toward F1, so a step back through the transcript is the outer
-    # key. This is the same direction as the pager on the right.
-    assert fkeys.PICOCALC_LYRA_DECK.action_for(spread.picocalc_lyra_lane, 1) == "ctrl_pageup"
-    spread.handle(fkeys.PICOCALC_LYRA_DECK.action_for(spread.picocalc_lyra_lane, 1))
-    assert spread._selected == 0  # moved to the first message of the older day
+    lane = spread.picocalc_lyra_lane
+    actions = {action for pair in lane if pair for action in (pair.action, pair.opp_action)}
+    assert not actions & {"ctrl_pageup", "ctrl_pagedown"}
+    deck = fkeys.PICOCALC_LYRA_DECK
+    assert "Day" not in deck.lane_text(lane).plain + deck.lane_text(lane, shifted=True).plain
+
+    spread.handle("ctrl_pageup")
+    assert spread._selected == 0  # the key still moves to the first message of the older day
+
+
+def test_channel_and_dm_lanes_share_f1_to_f3_and_keep_their_own_verbs_behind_shift() -> None:
+    """The plain bank of F1 to F3 is the same in each conversation (JP, 2026-10-10).
+
+    The verbs that the screens share are there, in the order of the hint. The Shift bank
+    has the verbs of one screen: ``Retry`` in a DM and ``Resend`` in a channel, both ^R.
+    """
+    from tests.conftest import recording_locator
+
+    messages = [ChatMessage(text="hi", peer="d4e5f6a7")]
+    direct = ChatScreen(
+        Conversation(
+            label="Alice",
+            is_channel=False,
+            contact=Contact(name="Alice", public_key="d4" + "0" * 62, key_prefix="d4e5f6a7"),
+        ),
+        messages,
+        send=None,
+        names={},
+        session=_StubSession(),
+        locator=recording_locator([]),  # type: ignore[arg-type]
+    )
+
+    async def resend_unscoped(message: ChatMessage) -> ChatMessage:
+        return message
+
+    channel = ChatScreen(
+        Conversation(label="#general", is_channel=True, channel_id="1"),
+        [ChatMessage(text="Bob: hi", is_channel=True, channel_idx=0)],
+        send=None,
+        names={},
+        session=_StubSession(),
+        resend_unscoped=resend_unscoped,
+        locator=recording_locator([]),  # type: ignore[arg-type]
+    )
+    for screen in (direct, channel):
+        lane = screen.picocalc_lyra_lane
+        assert [pair.label for pair in lane[:3]] == ["Paths", "URL→QR", "Map"]
+        assert [pair.action for pair in lane[:3]] == ["paths", "url_code", "locate"]
+    assert direct.picocalc_lyra_lane[0].opp_label == "Retry"
+    assert channel.picocalc_lyra_lane[0].opp_label == "Resend"
+    assert channel.picocalc_lyra_lane[0].opp_action == direct.picocalc_lyra_lane[0].opp_action
 
 
 # -- URL codes (the PicoCalc) ---------------------------------------------------
@@ -2374,7 +2634,7 @@ def test_on_the_picocalc_each_url_hangs_a_code_under_its_message_side_by_side() 
     screen = ChatScreen(conv, [message], send=None, names={}, session=_StubSession())
     rows = _code_rows(_strip_ansi(screen._render_grouped(53)).splitlines())
 
-    indent = 9  # "  HH:MM  ", the hanging indent of the body
+    indent = 11  # "    HH:MM  ", the hanging indent of the body
     assert rows and all(len(row) <= 53 and row.startswith(" " * indent) for row in rows)
     cells = [row[indent:].ljust(53 - indent) for row in rows]
     left, tallest = 0, 0
@@ -2446,7 +2706,7 @@ def test_a_picked_message_keeps_its_codes_in_view() -> None:
 
 # -- URLs kept whole, and their codes on ^U --------------------------------------------
 
-#: A link that is longer than the regular body lane (72 minus the 9-cell gutter), but that
+#: A link that is longer than the regular body lane (72 minus the 11-cell gutter), but that
 #: the screen can hold.
 _LONG_URL = "https://github.com/jpmartineau/MeshTerm/blob/main/meshterm/ui/chat.py"
 
@@ -2460,7 +2720,7 @@ def _url_chat(text: str, session=None) -> ChatScreen:  # noqa: ANN001
 def test_a_url_too_long_to_hang_steps_out_to_the_gutter_whole() -> None:
     """A link that the body lane cannot hold, but the screen can, is drawn whole on one line.
 
-    It starts under the timestamp, away from the ``❯`` of the selected message. The body
+    It starts in the column after the ``❯`` of the selected message. The body
     continues at its own indent after the link, so only the link leaves the block.
     """
     screen = _url_chat(f"look at {_LONG_URL} and tell me what you think of it all")
@@ -2468,7 +2728,7 @@ def test_a_url_too_long_to_hang_steps_out_to_the_gutter_whole() -> None:
     link = next(row for row in rows if _LONG_URL[:20] in row)
     assert link == "  " + _LONG_URL  # whole, at the gutter
     after = rows[rows.index(link) + 1]
-    assert after.startswith(" " * 9 + "and tell me")  # back under the indent of the body
+    assert after.startswith(" " * 11 + "and tell me")  # back under the indent of the body
 
     screen.handle("up")  # selected: the ❯ is on the first line, not on the line of the link
     rows = _strip_ansi(screen._render_grouped(72)).splitlines()
@@ -2477,16 +2737,16 @@ def test_a_url_too_long_to_hang_steps_out_to_the_gutter_whole() -> None:
 
 def test_a_short_tail_finishes_the_links_line_and_a_too_wide_link_still_folds() -> None:
     """Text that fits after a link at the gutter stays on its line. A wider link folds."""
-    url = "https://meshterm.net/" + "a" * 46  # 67 cells: wider than the lane of 63 cells
+    url = "https://meshterm.net/" + "a" * 46  # 67 cells: wider than the lane of 61 cells
     rows = _strip_ansi(_url_chat(f"see {url} ok")._render_grouped(72)).splitlines()
     assert "  " + url + " ok" in rows  # 2 + 67 + 3: the width of the screen
     rows = _strip_ansi(_url_chat(f"see {url} ok!")._render_grouped(72)).splitlines()
-    assert "  " + url in rows and " " * 9 + "ok!" in rows  # one cell too many: below it
+    assert "  " + url in rows and " " * 11 + "ok!" in rows  # one cell too many: below it
 
     wide = "https://meshterm.net/" + "b" * 60  # 81 cells: wider than the screen
     rows = _strip_ansi(_url_chat(f"see {wide}")._render_grouped(72)).splitlines()
     assert not any(wide in row for row in rows)  # cut, as before
-    assert all(row.startswith(" " * 9) for row in rows if "bbb" in row)  # hanging, as before
+    assert all(row.startswith(" " * 11) for row in rows if "bbb" in row)  # hanging, as before
 
 
 def test_ctrl_u_opens_the_picked_messages_links_on_one_share_screen() -> None:
@@ -2522,10 +2782,8 @@ def test_ctrl_u_is_named_only_on_a_picked_message_with_a_link() -> None:
     linked.handle("up")
     plain.handle("up")
     assert "^U QR" in linked.footer_hint and "^U" not in plain.footer_hint
-    assert (
-        fkeys.PICOCALC_LYRA_DECK.action_for(linked.picocalc_lyra_lane, 7) == "url_code"
-    )  # Shift+F2
-    assert linked.picocalc_lyra_lane[1].opp_enabled and not plain.picocalc_lyra_lane[1].opp_enabled
+    assert fkeys.PICOCALC_LYRA_DECK.action_for(linked.picocalc_lyra_lane, 2) == "url_code"  # F2
+    assert linked.picocalc_lyra_lane[1].enabled and not plain.picocalc_lyra_lane[1].enabled
 
     # The hint of each selection state, with a link in it, fits in the 72-cell budget.
     direct = _screen(
@@ -2558,7 +2816,7 @@ def test_on_the_cardputer_a_link_takes_the_share_screen_as_on_the_desktop() -> N
     screen = _url_chat(f"the road list is at {url}")
     assert not _code_rows(_strip_ansi(screen._render_grouped(53)).splitlines())
     screen.handle("up")
-    assert fkeys.CARDPUTER_ZERO_DECK.action_for(screen.cardputer_zero_lane, 17) == "url_code"
+    assert fkeys.CARDPUTER_ZERO_DECK.action_for(screen.cardputer_zero_lane, 5) == "url_code"
 
     share = QrScreen(url, title="Links")
     share.note_viewport(14)
@@ -2744,3 +3002,496 @@ def test_only_the_acks_the_radio_could_still_push_are_awaited(repo: Repository) 
     assert messages[0].acked is False
     chat._settle_ack(f"{39:08x}")
     assert messages[39].acked is True
+
+
+# --- ^L: the map on the author ------------------------------------------------------------
+
+#: A node with a location, and our node.
+_ALICE_AT = MapMarker(label="Alice", lat=45.5, lon=-73.6, key="a1" * 32)
+_US_AT = MapMarker(label="Base", lat=45.4, lon=-73.5, is_self=True, key="ee" * 32)
+
+
+async def test_chat_locate_opens_the_map_on_the_author_of_the_selected_message() -> None:
+    """^L opens the map on the author of the selected message, and is named only where it acts."""
+    from tests.conftest import recording_locator
+
+    locator = recording_locator([_ALICE_AT, _US_AT])
+    keys = {"alice": "a1" * 32, "bob": "b2" * 32}
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [
+            ChatMessage(text="Alice: hi", is_channel=True, channel_idx=0),
+            ChatMessage(text="Bob: yo", is_channel=True, channel_idx=0),
+            ChatMessage(text="hello", outbound=True, is_channel=True, channel_idx=0),
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: keys.get(name.casefold()),
+        locator=locator,  # type: ignore[arg-type]
+    )
+    # With no selected message, ^L does nothing. The hint does not name it, and its chip on
+    # F3 is dim.
+    screen.handle("locate")
+    await asyncio.sleep(0)
+    assert locator.shown == []
+    assert "^L" not in screen.footer_hint
+    assert screen.picocalc_lyra_lane[2].label == "Map"
+    assert screen.picocalc_lyra_lane[2].enabled is False
+
+    # Our own message: its author is our node.
+    screen.handle("up")
+    assert "^L map" in screen.footer_hint
+    screen.handle("locate")
+    await asyncio.sleep(0)
+    assert locator.shown == [_US_AT]
+
+    # Bob has a key but no location, so there is nothing to show.
+    screen.handle("up")
+    assert "^L" not in screen.footer_hint
+    assert screen.picocalc_lyra_lane[2].enabled is False
+    screen.handle("locate")
+    await asyncio.sleep(0)
+    assert locator.shown == [_US_AT]
+
+    # Alice has a location. The chip is lit, and F3 sends the same action as ^L.
+    screen.handle("up")
+    assert "^L map" in screen.footer_hint
+    assert screen.picocalc_lyra_lane[2].enabled is True
+    assert fkeys.PICOCALC_LYRA_DECK.action_for(screen.picocalc_lyra_lane, 3) == "locate"
+    screen.handle("locate")
+    await asyncio.sleep(0)
+    assert locator.shown == [_US_AT, _ALICE_AT]
+
+
+def test_chat_without_a_locator_has_no_map_chip() -> None:
+    """A chat that cannot locate leaves F3 empty, not dim."""
+    screen = _screen(_StubSession(), send=None, messages=[ChatMessage(text="hi", peer="d4e5f6a7")])
+    assert screen.picocalc_lyra_lane[2] is None
+
+
+async def test_chat_author_page_opens_the_node_page_of_the_author_of_the_selection() -> None:
+    """^O opens the node page of the author of the selected message, named only where it acts.
+
+    It is the twin of ^L: the same author, found by the same key. Its chip is ``Author``,
+    on the Shift half of F3, behind ``Map``.
+    """
+    from tests.conftest import recording_pages
+
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+    pages = recording_pages([alice])
+    keys = {"alice": "a1" * 32, "bob": "b2" * 32}
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [
+            ChatMessage(text="Alice: hi", is_channel=True, channel_idx=0),
+            ChatMessage(text="Bob: yo", is_channel=True, channel_idx=0),
+            ChatMessage(text="hello", outbound=True, is_channel=True, channel_idx=0),
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: keys.get(name.casefold()),
+        pages=pages,  # type: ignore[arg-type]
+    )
+    # With no selected message, ^O does nothing. The hint does not name it, and its chip is
+    # dim. The screen has no locator, so the plain half of F3 is empty.
+    screen.handle("author_page")
+    await asyncio.sleep(0)
+    assert pages.shown == []
+    assert "^O" not in screen.footer_hint
+    lane = screen.picocalc_lyra_lane
+    assert (lane[2].label, lane[2].opp_label) == ("", "Author")
+    assert lane[2].opp_enabled is False
+
+    # Our own message: its author is our node, whose page has no contact.
+    screen.handle("up")
+    assert "^O author" in screen.footer_hint
+    screen.handle("author_page")
+    await asyncio.sleep(0)
+    assert pages.shown == [None]
+
+    # Bob has a key but he is not a contact, so there is no page to open.
+    screen.handle("up")
+    assert "^O" not in screen.footer_hint
+    assert screen.picocalc_lyra_lane[2].opp_enabled is False
+    screen.handle("author_page")
+    await asyncio.sleep(0)
+    assert pages.shown == [None]
+
+    # Alice is a contact. The chip is lit, and Shift+F3 sends the same action as ^O.
+    screen.handle("up")
+    assert "^O author" in screen.footer_hint
+    assert screen.picocalc_lyra_lane[2].opp_enabled is True
+    assert fkeys.PICOCALC_LYRA_DECK.action_for(screen.picocalc_lyra_lane, 8) == "author_page"
+    screen.handle("author_page")
+    await asyncio.sleep(0)
+    assert pages.shown == [None, alice]
+
+
+def test_a_direct_chat_finds_the_page_of_its_peer() -> None:
+    """In a DM, the author of an inbound message is the peer, and the peer is a contact."""
+    from tests.conftest import recording_pages
+
+    peer = Contact(name="Alice", public_key="d4" + "0" * 62, key_prefix="d4e5f6a7")
+    screen = ChatScreen(
+        Conversation(label="Alice", is_channel=False, contact=peer),
+        [ChatMessage(text="hi", peer="d4e5f6a7")],
+        send=None,
+        names={"d4e5f6a7": "Alice"},
+        session=_StubSession(),
+        pages=recording_pages([peer]),  # type: ignore[arg-type]
+    )
+    screen.handle("up")
+    assert "^O author" in screen.footer_hint
+    assert cell_len(screen.footer_hint) <= 72
+
+
+def test_k_locks_and_unlocks_the_author_of_the_selected_message(tmp_path: Path) -> None:
+    """^K toggles the lock of the author of the selected message (JP, 2026-10-19).
+
+    It is the third verb about the author, with ^L and ^O, and it finds the same contact.
+    The hint and the Shift half of F2 say ``lock`` or ``unlock``, so they also show the
+    state. The status line tells what the key did. Our own message, and an author that is
+    not a contact, have nothing to lock.
+    """
+    from meshterm.core.contact_store import ContactStore
+    from meshterm.ui.tui.session import _CTRL_LETTER_CHORDS
+    from tests.conftest import recording_pages
+
+    assert _CTRL_LETTER_CHORDS["k"] == "lock"
+    store = ContactStore(tmp_path / "contacts.json")
+    dev = "cc" * 32
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+    keys = {"alice": "a1" * 32, "bob": "b2" * 32}
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [
+            ChatMessage(text="Alice: hi", is_channel=True, channel_idx=0),
+            ChatMessage(text="Bob: yo", is_channel=True, channel_idx=0),
+            ChatMessage(text="hello", outbound=True, is_channel=True, channel_idx=0),
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: keys.get(name.casefold()),
+        pages=recording_pages([alice], store=store, self_key=dev),  # type: ignore[arg-type]
+    )
+    # With no selected message, ^K does nothing, and its chip is dim.
+    lane = screen.picocalc_lyra_lane
+    assert (lane[1].opp_label, lane[1].opp_action, lane[1].opp_enabled) == ("Lock", "lock", False)
+    screen.handle("lock")
+    assert store.locked_keys(dev) == frozenset()
+
+    # Our own message, then Bob, who is not a contact: nothing to lock.
+    for _ in range(2):
+        screen.handle("up")
+        assert "^K" not in screen.footer_hint
+        assert screen.picocalc_lyra_lane[1].opp_enabled is False
+
+    # Alice is a contact. Shift+F2 sends the same action as ^K.
+    screen.handle("up")
+    hint = screen.footer_hint
+    assert "^K lock" in hint and "^O author" in hint and "↑↓ pick" in hint
+    assert cell_len(hint) <= 72
+    lane = screen.picocalc_lyra_lane
+    assert lane[1].opp_enabled is True
+    assert fkeys.PICOCALC_LYRA_DECK.action_for(lane, 7) == "lock"
+    screen.handle("lock")
+    assert store.is_locked(dev, "a1" * 32)
+    assert "Locked Alice" in screen._status
+    assert "^K unlock" in screen.footer_hint
+    assert screen.picocalc_lyra_lane[1].opp_label == "Unlock"
+
+    # The same key reverses it.
+    screen.handle("lock")
+    assert not store.is_locked(dev, "a1" * 32)
+    assert screen._status == "Unlocked Alice"
+    assert "^K lock" in screen.footer_hint
+
+
+@pytest.mark.parametrize("chips", [True, False])
+def test_a_locked_author_has_the_padlock_on_its_sender_chip(
+    tmp_path: Path,
+    powerline,  # noqa: ANN001
+    chips: bool,
+) -> None:
+    """A locked contact reads ``🔒 Name`` on its sender chip, as our chip reads ``★ Name``.
+
+    JP, 2026-10-19. The padlock is in the label, so arrow mode has it too. The transcript
+    keeps the lines of each message in a cache, but a change of the locks draws the chips
+    again: here the lock goes away as the node page would remove it, with no key press in
+    the chat.
+    """
+    from meshterm.core.contact_store import ContactStore
+    from tests.conftest import recording_pages
+
+    powerline(chips)
+    store = ContactStore(tmp_path / "contacts.json")
+    dev = "cc" * 32
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+    store.set_locked(dev, alice, True)
+    pages = recording_pages([alice], store=store, self_key=dev)
+    keys = {"alice": "a1" * 32, "bob": "b2" * 32}
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [
+            ChatMessage(text="Alice: hi", is_channel=True, channel_idx=0),
+            ChatMessage(text="Bob: yo", is_channel=True, channel_idx=0),
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: keys.get(name.casefold()),
+        pages=pages,  # type: ignore[arg-type]
+    )
+    shown = _strip_ansi(screen.render_body(60))
+    assert "\U0001f512 Alice" in shown
+    assert "\U0001f512 Bob" not in shown  # Bob is not a contact, so he has no lock
+
+    pages.set_locked(alice, False)  # type: ignore[attr-defined]
+    shown = _strip_ansi(screen.render_body(60))
+    assert "\U0001f512" not in shown and "Alice" in shown
+
+
+@pytest.mark.parametrize("chips", [True, False])
+def test_the_chips_of_the_selected_message_turn_white_with_its_text(
+    powerline,  # noqa: ANN001
+    chips: bool,
+) -> None:
+    """On the selected message, a mention chip has a white label, as the text around it does.
+
+    JP, 2026-10-19. A chip keeps its fill, so it still tells one node from the next. In
+    arrow mode, the label takes the ``cursor`` white. A node that no key can place turns
+    white too: its grey fill already says that the node is unknown.
+    """
+    powerline(chips)
+    keys = {"alice": "a1" * 32, "bob": "b2" * 32}
+    body = "hi @[Bob] and @[Zed]"
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [ChatMessage(text=f"Alice: {body}", is_channel=True, channel_idx=0)],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: keys.get(name.casefold()),
+    )
+
+    def styles(label: str, *, selected: bool) -> str:
+        text = screen._render_mentions(body, selected=selected)
+        at = text.plain.index(label)
+        return " ".join(str(s.style) for s in text.spans if s.start <= at < s.end)
+
+    white = "#ffffff" if chips else "cursor"
+    assert white in styles("Bob", selected=True)
+    assert white not in styles("Bob", selected=False)
+    assert white in styles("Zed", selected=True)
+    assert white not in styles("Zed", selected=False)
+
+
+@pytest.mark.parametrize("chips", [True, False])
+def test_the_author_chip_of_the_selected_message_turns_white(
+    powerline,  # noqa: ANN001
+    chips: bool,
+) -> None:
+    """The author chip of the group of the selected message has a white label (JP, 2026-10-19).
+
+    The chip is drawn with the first message of the group. Thus that message draws again
+    when the selection is lower in the group, and again when the selection leaves the group,
+    although the transcript keeps each message in a cache.
+    """
+    powerline(chips)
+    keys = {"alice": "a1" * 32}
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [
+            ChatMessage(text="Alice: one", is_channel=True, channel_idx=0),
+            ChatMessage(text="Alice: two", is_channel=True, channel_idx=0),
+            ChatMessage(text="Zed: three", is_channel=True, channel_idx=0),
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: keys.get(name.casefold()),
+    )
+    white = "#ffffff" if chips else "cursor"
+    for sender, message in (("Alice", screen._messages[0]), ("Zed", screen._messages[2])):
+        picked = screen._group_header(sender, message, picked=True)
+        plain = screen._group_header(sender, message)
+        assert white in " ".join(str(s.style) for s in picked.spans)
+        assert white not in " ".join(str(s.style) for s in plain.spans)
+
+    calls: list[tuple[str, bool]] = []
+    header = screen._group_header
+
+    def spy(sender, message, *, picked=False):  # noqa: ANN001, ANN202
+        calls.append((sender, picked))
+        return header(sender, message, picked=picked)
+
+    screen._group_header = spy  # type: ignore[method-assign]
+    screen.render_body(60)
+    assert calls == [("Alice", False), ("Zed", False)]
+
+    calls.clear()
+    screen.handle("up")
+    screen.handle("up")  # the second message of Alice: its group is the first one
+    screen.render_body(60)
+    assert calls == [("Alice", True)]
+
+    calls.clear()
+    screen.handle("down")  # Zed: the chip of Alice goes back, and the chip of Zed is white
+    screen.render_body(60)
+    assert calls == [("Alice", False), ("Zed", True)]
+
+
+def test_the_lock_atom_never_pushes_another_key_out_of_the_hint(tmp_path: Path) -> None:
+    """With a link and a location, the hint has no room for ^K, so the atom stays out.
+
+    The other keys stay as they are without it (JP, 2026-10-19: "If there's room, put
+    it."). The chip on the lane and the key itself still work.
+    """
+    from meshterm.core.contact_store import ContactStore
+    from tests.conftest import recording_locator, recording_pages
+
+    store = ContactStore(tmp_path / "contacts.json")
+    dev = "cc" * 32
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+
+    def build(pages: object) -> ChatScreen:
+        screen = ChatScreen(
+            Conversation(label="#public", is_channel=True, channel_idx=0),
+            [ChatMessage(text="Alice: see https://meshterm.net", is_channel=True, channel_idx=0)],
+            send=None,
+            names={},
+            session=_StubSession(),
+            key_of=lambda name: "a1" * 32 if name == "Alice" else None,
+            locator=recording_locator([_ALICE_AT]),  # type: ignore[arg-type]
+            pages=pages,  # type: ignore[arg-type]
+        )
+        screen.handle("up")
+        return screen
+
+    without = build(recording_pages([alice])).footer_hint
+    screen = build(recording_pages([alice], store=store, self_key=dev))
+    assert "^K" not in screen.footer_hint
+    assert screen.footer_hint == without
+    assert screen.picocalc_lyra_lane[1].opp_enabled is True
+    screen.handle("lock")
+    assert store.is_locked(dev, "a1" * 32)
+
+
+def test_a_chat_without_a_lock_store_has_no_lock_chip() -> None:
+    """Where MeshTerm cannot store a lock, the Shift half of F2 is empty, not dim."""
+    from tests.conftest import recording_pages
+
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [ChatMessage(text="Alice: hi", is_channel=True, channel_idx=0)],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: "a1" * 32,
+        pages=recording_pages([alice]),  # type: ignore[arg-type]
+    )
+    screen.handle("up")
+    assert screen.picocalc_lyra_lane[1].opp_label == ""
+    assert "^K" not in screen.footer_hint
+
+
+def test_chat_hint_with_all_its_keys_fits_in_72_cells() -> None:
+    """The longest hint (a scoped message of ours, with a link, on the map) fits in 72 cells.
+
+    The ↑↓ atom goes first, then ^P. The keys that only this message offers stay.
+    """
+
+    async def resend_unscoped(message: ChatMessage) -> ChatMessage | None:
+        return None
+
+    from tests.conftest import recording_locator
+
+    screen = ChatScreen(
+        Conversation(label="#ops", is_channel=True, channel_idx=1),
+        [
+            ChatMessage(
+                text="map at https://meshterm.net",
+                outbound=True,
+                is_channel=True,
+                channel_idx=1,
+                scope="yul",
+            )
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        scope="yul",
+        resend_unscoped=resend_unscoped,
+        locator=recording_locator([_US_AT]),  # type: ignore[arg-type]
+    )
+    screen.handle("up")
+    hint = screen.footer_hint
+    assert cell_len(hint) <= 72
+    for atom in ("Enter reply", "^U QR", "^L map", "^R resend unscoped", "Esc cancel"):
+        assert atom in hint
+    assert "↑↓ pick" not in hint and "^P paths" not in hint
+
+
+def test_chat_resend_hint_drops_our_own_page_third() -> None:
+    """With ^O too, the resend hint drops ↑↓, then ^P, then ^O: the message is ours."""
+
+    async def resend_unscoped(message: ChatMessage) -> ChatMessage | None:
+        return None
+
+    from tests.conftest import recording_locator, recording_pages
+
+    screen = ChatScreen(
+        Conversation(label="#ops", is_channel=True, channel_idx=1),
+        [
+            ChatMessage(
+                text="map at https://meshterm.net",
+                outbound=True,
+                is_channel=True,
+                channel_idx=1,
+                scope="yul",
+            )
+        ],
+        send=None,
+        names={},
+        session=_StubSession(),
+        scope="yul",
+        resend_unscoped=resend_unscoped,
+        locator=recording_locator([_US_AT]),  # type: ignore[arg-type]
+        pages=recording_pages([]),  # type: ignore[arg-type]
+    )
+    screen.handle("up")
+    hint = screen.footer_hint
+    assert cell_len(hint) <= 72
+    for atom in ("Enter reply", "^U QR", "^L map", "^R resend unscoped", "Esc cancel"):
+        assert atom in hint
+    assert "↑↓ pick" not in hint and "^P paths" not in hint and "^O" not in hint
+
+
+def test_chat_reply_hint_with_every_key_of_a_selection_fits_in_72_cells() -> None:
+    """A message of a located contact, with a link: the reply hint takes its short words.
+
+    With ^U, ^L, and ^O, the long words (``(@mention)``, ``^End/Esc``) do not fit. The
+    short words of the resend hint do, and then each key of the selection stays.
+    """
+    from tests.conftest import recording_locator, recording_pages
+
+    alice = Contact(name="Alice", public_key="a1" * 32, key_prefix="a1" * 6)
+    screen = ChatScreen(
+        Conversation(label="#public", is_channel=True, channel_idx=0),
+        [ChatMessage(text="Alice: map at https://meshterm.net", is_channel=True, channel_idx=0)],
+        send=None,
+        names={},
+        session=_StubSession(),
+        key_of=lambda name: "a1" * 32 if name.casefold() == "alice" else None,
+        locator=recording_locator([_ALICE_AT]),  # type: ignore[arg-type]
+        pages=recording_pages([alice]),  # type: ignore[arg-type]
+    )
+    screen.handle("up")
+    hint = screen.footer_hint
+    assert cell_len(hint) <= 72
+    for atom in ("Enter reply", "^P paths", "^U QR", "^L map", "^O author", "Esc cancel"):
+        assert atom in hint

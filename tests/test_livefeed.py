@@ -243,6 +243,36 @@ def test_livefeed_addressed_frame_is_about_its_two_ends() -> None:
     assert "a1 → Hilltop-Repe" in _rows(wide, 100)[0]
 
 
+def test_livefeed_addressed_frame_draws_its_two_ends_as_chips(powerline) -> None:
+    """With chips, the sender's point and the recipient's notch face each other across a cell.
+
+    A seam would claim that the two are neighbours, and the relays between them are not
+    drawn. A pair that is too wide for the lane cracks at the lane, and is not elided.
+    """
+    from meshterm.ui.pathline import CRACK_TAIL, POWERLINE_SEP
+
+    powerline(True)
+    screen = _screen(self_name="Us")
+    raw = {"payload_typename": "TEXT_MSG", "dest_hash": "c0", "src_hash": "a1"}
+    screen.on_event(MeshEvent.observation_event(_obs(node="", kind="packet", raw=raw)))
+    assert f" Alice {POWERLINE_SEP} {POWERLINE_SEP} ★ " in _rows(screen, 100)[0]
+
+    wide = _screen()
+    wide._resolve = lambda h: {"a1": "Alice-With-A-Long-Name", "3d": "Hilltop-Repeater"}.get(h, "")
+    wide.on_event(
+        MeshEvent.observation_event(
+            _obs(
+                node="",
+                kind="packet",
+                raw={"payload_typename": "REQ", "dest_hash": "3d", "src_hash": "a1"},
+            )
+        )
+    )
+    row = _rows(wide, 100)[0]
+    assert f" a1 {POWERLINE_SEP} {POWERLINE_SEP} Hilltop" in row
+    assert CRACK_TAIL in row and "…" not in row
+
+
 def test_livefeed_tokened_classes_are_about_their_token() -> None:
     """An ack names the message that it answers. A trace names its tag. Neither says "packet"."""
     screen = _screen()
@@ -366,12 +396,30 @@ def test_livefeed_home_resumes_following_from_deep_in_the_history() -> None:
     assert screen._selected == 0  # the feed follows again, and does not stay on the old newest
 
 
-def test_livefeed_opening_a_packet_drops_the_pin() -> None:
-    """Enter names this packet, so an arrival during a long read cannot move the highlight."""
+def test_livefeed_opening_a_packet_keeps_the_pin() -> None:
+    """Enter on the pin opens the viewer on the pin, so the feed and the card both follow.
+
+    JP decided this on 2026-10-10. Before, Enter removed the pin.
+    """
     screen = _screen(seed=[_obs(node="n0", age_s=1)])
-    screen.future = _Fut()
     assert screen._pinned
-    screen._select_row(0)  # this is what _open_packet does before it floats the viewer
+    screen.handle("enter")
+    viewer = screen._session.opened
+    assert viewer is not None and viewer._pinned and "following" in viewer.title
+    assert screen._pinned, "Enter knocked the feed out of the stream"
+
+    screen.on_event(MeshEvent.observation_event(_obs(node="a1b2")))
+    assert screen._selected == 0, "the pin let go of the top"
+    assert "Alice" in _plain(viewer.render_body(72)), "the card did not follow the stream"
+
+
+def test_livefeed_opening_a_selected_packet_holds_it() -> None:
+    """Enter on a selected packet holds it, so an arrival during a long read cannot move it."""
+    screen = _screen(seed=[_obs(node="n0", age_s=1)])
+    screen.handle("down")  # off the pin, onto the newest packet
+    screen.handle("enter")
+    viewer = screen._session.opened
+    assert viewer is not None and not viewer._pinned
     assert not screen._pinned and screen._selected == 0
     screen.on_event(MeshEvent.observation_event(_obs(node="a1b2")))
     assert screen._selected == 1, "the cursor left the packet being viewed"
@@ -380,11 +428,12 @@ def test_livefeed_opening_a_packet_drops_the_pin() -> None:
 def test_livefeed_viewer_that_walks_up_to_the_stream_re_pins_the_feed() -> None:
     """The viewer has the second stop of this screen, and it returns the pin through it.
 
-    Enter still names this packet, so the dialog opens with one packet. The user can press
-    up at the top of the viewer. This is the same move as up at the top of the feed. Thus
-    the feed follows the stream again, and it still follows when the dialog closes.
+    Enter on a selected packet opens the dialog on that packet. The user can press up at
+    the top of the viewer. This is the same move as up at the top of the feed. Thus the
+    feed follows the stream again, and it still follows when the dialog closes.
     """
     screen = _screen(seed=[_obs(node="n0", age_s=2), _obs(node="n1", age_s=1)])
+    screen.handle("down")  # off the pin, onto the newest packet
     screen.handle("enter")
     viewer = screen._session.opened
     assert viewer is not None and not screen._pinned

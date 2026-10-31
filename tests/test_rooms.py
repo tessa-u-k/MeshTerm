@@ -696,6 +696,8 @@ def _view(
     access: RoomAccess | None = RoomAccess.MEMBER,
     joined: bool = True,
     login: RoomLogin | None = None,
+    locator: object = None,
+    pages: object = None,
 ) -> tuple[RoomScreen, dict]:
     """A board with stub hooks. ``calls`` records the requests to the hooks."""
     calls: dict = {"auto": 0, "joins": [], "sent": []}
@@ -726,6 +728,8 @@ def _view(
         join=join,
         joined=joined,
         access=access,
+        locator=locator,  # type: ignore[arg-type]
+        pages=pages,  # type: ignore[arg-type]
     )
     return screen, calls
 
@@ -806,7 +810,7 @@ async def test_after_silence_nothing_can_be_posted_and_the_line_says_why() -> No
     screen.begin_auto_login()
     await _settled(screen)
     assert screen.title.endswith(NO_REPLY)
-    assert "no answer" in _compose(screen) and "^L" in _compose(screen)
+    assert "no answer" in _compose(screen) and "^G" in _compose(screen)
     for ch in "hi":
         screen.handle("text", ch)
     screen.handle("enter")
@@ -816,18 +820,18 @@ async def test_after_silence_nothing_can_be_posted_and_the_line_says_why() -> No
 
 
 async def test_control_l_runs_the_explained_login() -> None:
-    """^L gives the login to the Rooms flow, with its dialogs over the board, and shows the end."""
+    """^G gives the login to the Rooms flow, with its dialogs over the board, and shows the end."""
     screen, calls = _view(access=None, login=RoomLogin(LoginResult.ACCEPTED, RoomAccess.ADMIN))
     screen.handle("login")
     assert screen._login_open
-    assert "^L log in" not in screen.footer_hint  # a second press does nothing
+    assert "^G log in" not in screen.footer_hint  # a second press does nothing
     await _settled(screen)
     assert calls["joins"] == [False]
     assert screen.title == f"{ROOM.name} · admin" and screen._composing
 
 
 async def test_a_read_only_member_is_asked_for_another_password_and_offered_no_retry() -> None:
-    """^L asks, because the room password lets a read-only member post. ^R is only dropped."""
+    """^G asks, because the room password lets a read-only member post. ^R is only dropped."""
     unacked = ChatMessage(text="lost", outbound=True, peer=ROOM.key_prefix, acked=False)
     screen, calls = _view([unacked], access=RoomAccess.READ_ONLY)
     assert "read-only" in _compose(screen)
@@ -876,20 +880,103 @@ async def test_a_read_only_member_picks_a_post_to_see_its_paths_not_to_reply() -
 
 
 def test_the_hint_names_log_in_and_fits() -> None:
-    """The hint names ^L where it acts, in 72 cells, with or without a selected post."""
+    """The hint names ^G where it acts, in 72 cells, with or without a selected post."""
     screen, _ = _view(_board())
-    assert "^L log in" in screen.footer_hint
+    assert "^G log in" in screen.footer_hint
     assert cell_len(screen.footer_hint) <= 72
     screen.handle("up")
     assert cell_len(screen.footer_hint) <= 72
 
 
-def test_the_handheld_lane_puts_log_in_behind_f1() -> None:
-    """Each chord has a chip where the keyboard has no Ctrl key to reach it."""
+def test_the_handheld_lane_puts_log_in_behind_f2() -> None:
+    """Each chord has a chip where the keyboard has no Ctrl key to reach it.
+
+    Log in is a verb of the room only, so it is in the Shift bank, next to Retry.
+    """
     screen, _ = _view(_board())
     lane = screen.picocalc_lyra_lane
-    assert lane[0].opp_label == "Log in"
-    assert fkeys.PICOCALC_LYRA_DECK.action_for(lane, 6) == "login"
+    assert lane[1].opp_label == "Log in"
+    assert fkeys.PICOCALC_LYRA_DECK.action_for(lane, 7) == "login"
+    assert lane[0].opp_label == "Retry"
+    # The plain bank of F1 to F3 is the one of each conversation (refer to test_chat).
+    assert [pair.label for pair in lane[:2]] == ["Paths", "URL→QR"]
+
+
+async def test_o_opens_the_node_page_of_the_author_of_a_post() -> None:
+    """^O opens the page of the contact that signed the selected post, by its key prefix."""
+    from tests.conftest import recording_pages
+
+    alice = Contact(name="Alice", public_key=ALICE_KEY + "0" * 56, key_prefix=ALICE_KEY + "0000")
+    pages = recording_pages([alice])
+    screen, _ = _view(_board(), pages=pages)
+    for _ in range(4):
+        screen.handle("up")  # the oldest post, by Alice
+    assert "^O author" in screen.footer_hint
+    screen.handle("author_page")
+    await asyncio.sleep(0)
+    assert pages.shown == [alice]
+    # No contact has the key of the stranger, so ^O does nothing, and the hint does not name it.
+    screen.handle("down")
+    assert "^O" not in screen.footer_hint
+    screen.handle("author_page")
+    await asyncio.sleep(0)
+    assert pages.shown == [alice]
+    assert screen.picocalc_lyra_lane[2].opp_label == "Author"
+
+
+def test_k_locks_the_author_of_a_post_and_the_lane_keeps_log_in(tmp_path) -> None:  # noqa: ANN001
+    """^K locks the contact that signed the selected post, as in a channel and a DM.
+
+    In a room, Shift+F2 is ``Log in``, so the lane has no ``Lock`` chip there. On a
+    handheld, the user locks from the ``Author`` page, which a conversation opens with its
+    lock row (JP, 2026-10-19).
+    """
+    from meshterm.core.contact_store import ContactStore
+    from tests.conftest import recording_pages
+
+    store = ContactStore(tmp_path / "contacts.json")
+    dev = "cc" * 32
+    alice = Contact(name="Alice", public_key=ALICE_KEY + "0" * 56, key_prefix=ALICE_KEY + "0000")
+    screen, _ = _view(_board(), pages=recording_pages([alice], store=store, self_key=dev))
+    for _ in range(4):
+        screen.handle("up")  # the oldest post, by Alice
+    screen.handle("lock")
+    assert store.is_locked(dev, alice.public_key)
+    lane = screen.picocalc_lyra_lane
+    assert (lane[1].opp_label, lane[1].opp_action) == ("Log in", "login")
+
+
+def test_the_login_key_is_g_and_o_opens_the_author_page() -> None:
+    """^G logs in to a room, and ^O opens the page of the author of a message (JP, 2026-10-11)."""
+    from meshterm.ui.tui.session import _CTRL_LETTER_CHORDS
+
+    assert _CTRL_LETTER_CHORDS["g"] == "login"
+    assert _CTRL_LETTER_CHORDS["o"] == "author_page"
+
+
+async def test_l_opens_the_map_on_the_author_of_a_post() -> None:
+    """^L opens the map on the author of the selected post. ^G keeps the login."""
+    from meshterm.core.models import MapMarker
+    from tests.conftest import recording_locator
+
+    alice = MapMarker(label="Alice", lat=45.5, lon=-73.6, key=ALICE_KEY + "0" * 56)
+    locator = recording_locator([alice])
+    screen, _ = _view(_board(), locator=locator)
+    for _ in range(4):
+        screen.handle("up")  # the oldest post, by Alice
+    assert "^L map" in screen.footer_hint
+    screen.handle("locate")
+    await asyncio.sleep(0)
+    assert locator.shown == [alice]
+    # No marker places the stranger, so ^L does nothing, and the hint does not name it.
+    screen.handle("down")
+    assert "^L" not in screen.footer_hint
+    screen.handle("locate")
+    await asyncio.sleep(0)
+    assert locator.shown == [alice]
+    # Map is on F3, as in each conversation, and Log in is on the Shift half of F2.
+    assert screen.picocalc_lyra_lane[2].label == "Map"
+    assert screen.picocalc_lyra_lane[1].opp_label == "Log in"
 
 
 # --- joining: the explained flow ------------------------------------------------------

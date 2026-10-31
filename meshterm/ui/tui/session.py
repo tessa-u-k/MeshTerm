@@ -76,9 +76,15 @@ from .spinner import spinner_interval
 #: ``Keys.ControlM``/``ControlI``/``ControlH``. If this table claims them, it binds those
 #: keys again.
 #: The letter of a chord is the mnemonic of the action, not of the word that one screen uses
-#: for it. ``locate`` is ^Y for **you** (JP, 2026-08-09). It is the same keyboard key on the
-#: map and in the mesh walk, because on both it names our node. It was ^U until 2026-10-01.
-#: Then U went to ``url_code``: the links of a chat message as QR codes.
+#: for it. ``locate`` is ^L: on the map and in the mesh walk it goes to our node, and in the
+#: chat and on Contacts it opens the map on the node of the selected row. It was ^U until
+#: 2026-10-01, then ^Y until 2026-10-10, when ``login`` moved from ^L to ^O (JP). On
+#: 2026-10-11, ``login`` moved again to ^G, and ^O became ``author_page``: the node page of
+#: the author of the selected message, the same as ^L opens the map on that author (JP).
+#: One action for each letter in all screens is the preference, not the rule (JP,
+#: 2026-10-10). A screen that has no use for the action of a letter can give the letter a
+#: different action, if no terminal or multiplexer takes it. ^A and ^B are not free for
+#: this reason: they are the prefix keys of GNU screen and tmux.
 #:
 #: Two of these chords are for the full app, not for one screen:
 #:
@@ -96,8 +102,18 @@ from .spinner import spinner_interval
 #: ``IXON``/``IXOFF``, so ^Q is not XON here.
 _CTRL_LETTER_CHORDS: dict[str, str] = {
     "c": "quit",
-    # ^L logs in to the room that a room screen shows.
-    "l": "login",
+    # ^G logs in to the room that a room screen shows. In the input, ^G is not a special key:
+    # it is the bell only in output, and no terminal or multiplexer takes it.
+    "g": "login",
+    # ^K locks or unlocks the author of the selected message in a conversation (JP,
+    # 2026-10-19). No terminal or multiplexer takes it, and the raw mode of prompt_toolkit
+    # has no binding for it.
+    "k": "lock",
+    "l": "locate",
+    # ^O opens the node page of the author of the selected message. The raw mode of
+    # prompt_toolkit clears IEXTEN, so a terminal on macOS or BSD does not take ^O to
+    # discard output.
+    "o": "author_page",
     "p": "paths",
     "q": "quit",
     "r": "retry",
@@ -108,7 +124,6 @@ _CTRL_LETTER_CHORDS: dict[str, str] = {
     "u": "url_code",
     "v": "paste_clipboard",
     "w": "to_menu",
-    "y": "locate",
 }
 
 #: Maps the prompt_toolkit keys to the normalized action names that the screens understand.
@@ -146,6 +161,7 @@ _KEY_ACTIONS: dict[Any, str] = {
     Keys.Escape: "escape",
     Keys.Backspace: "backspace",
     Keys.Delete: "delete",
+    Keys.ShiftDelete: "shift_delete",
     Keys.Tab: "tab",
     Keys.BackTab: "shift_tab",
     # The function keys, for the F-key lane of a handheld. This table binds all of them,
@@ -477,8 +493,8 @@ def _message_border(message: Text | str) -> str:
     A note about a result has its severity as theme spans (``[err]``, ``[warn]``, ``[ok]``).
     Thus the border of the dialog can show the same severity. An error message gets the
     ``err`` border. A warning (for example "device rebooting") gets the caution border. All
-    the other messages, also the success messages, get the standard accent. A plain string
-    has no spans, and it is always neutral.
+    the other messages, also the success messages, get the grey of the standard border. A
+    plain string has no spans, and it is always neutral.
 
     Args:
         message: The message of the dialog, with styles or plain.
@@ -492,7 +508,7 @@ def _message_border(message: Text | str) -> str:
             return "err"
         if "warn" in styles:
             return "warn"
-    return "accent"
+    return "border"
 
 
 class Visit:
@@ -1510,6 +1526,7 @@ class TuiSession:
         help_text: str = "",
         password: bool = False,
         byte_limit: int | None = None,
+        compose: bool = False,
         floating: bool = False,
     ) -> str | None:
         """Show a text prompt. Return the string, or ``None`` if the user cancelled.
@@ -1523,6 +1540,9 @@ class TuiSession:
         ``byte_limit`` puts the shared UTF-8 byte gauge on the field, and blocks a submission
         that is longer than the limit. Use it for a field that goes into a packet with a
         maximum size (refer to :class:`TextScreen`).
+
+        ``compose`` gives the field the colours of the compose line of a chat. Use it for a
+        field that holds a message.
         """
         screen = TextScreen(
             title,
@@ -1532,6 +1552,7 @@ class TuiSession:
             help_text=help_text,
             password=password,
             byte_limit=byte_limit,
+            compose=compose,
         )
         runner = self.run_dialog if floating else self.run_screen
         result = await runner(screen)
@@ -1554,7 +1575,7 @@ class TuiSession:
         prompt_style: str = "",
         button_style: str = "selected",
         button_idle_style: str = "muted",
-        border_style: str = "accent",
+        border_style: str = "border",
         lane: Sequence[fkeys.FPair | None] | None = None,
     ) -> Any:
         """Show a centred button dialog. Return the chosen value, or ``None`` if cancelled.
@@ -1643,7 +1664,7 @@ class TuiSession:
         ("✓ flood advertisement sent") is too small for a full result screen. Thus it floats
         as a small dialog over the screen below it. Enter (OK) or Esc closes it. The border
         takes the strongest tone of the message (refer to :func:`_message_border`). Thus an
-        error shows in red, and a success stays in the standard accent. The method calls
+        error shows in red, and a success stays in the grey of the standard border. The method calls
         :meth:`button_dialog`, which floats the dialog over a blank base when the stack is
         empty (a tool that runs directly from the menu, which is popped while the tool
         runs).
@@ -2198,7 +2219,7 @@ class TuiSession:
         # centred below its banner, instead of stretched across the terminal.
         if not base.chrome:
             return self._emit(frame.compose_startup(base, cols, rows))
-        footer = self.top.footer_hint if self.top else base.footer_hint
+        footer = frame.fitted_footer(self.top or base, cols)
         lane = self._fkey_lane(self.top or base)
         return self._emit(
             frame.compose_base(self._header(cols), base, footer, cols, rows, footer_lane=lane)

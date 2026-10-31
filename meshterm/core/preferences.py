@@ -54,6 +54,7 @@ from .advert_store import DEFAULT_QUIET_S, QUIET_CHOICES_S
 from .atomicwrite import write_atomically
 from .courier_store import DONE_CAP
 from .geo import DEFAULT_VIEW_FRACTION
+from .models import NAME_OVERLAP_DAYS
 from .watch_store import ALERT_CAP, DEFAULT_SILENCE_HOURS, OFF, SILENCE_CHOICES_H
 
 if sys.version_info >= (3, 11):
@@ -171,6 +172,22 @@ _QUIET_CHOICES: dict[int, str] = {s: f"{s} s" for s in QUIET_CHOICES_S}
 #: :func:`meshterm.ui.tui.session._reclaim_last_column` for the terminals that hide a
 #: column, and for the cost when MeshTerm reclaims a column that is not hidden.
 _WIDTH_CHOICES: dict[str, str] = {"auto": "auto", "yes": "yes", "no": "no"}
+
+#: The smallest terminal, in rows, that gets a blank line before each section. The two
+#: ends are numbers too, so that one comparison (``rows >= value``) gives each choice: 0 is
+#: lower than each terminal, and :data:`_SPACING_NEVER` is higher than each terminal. The
+#: steps between them fall between the heights that MeshTerm knows: the 14 rows of the
+#: Cardputer Zero, a standard terminal of 24, the 26 and 40 rows of the two console fonts of
+#: the PicoCalc, and a tall window on a desktop.
+_SPACING_NEVER = 10_000
+_SPACING_CHOICES: dict[int, str] = {
+    0: "any height",
+    20: "20+ rows",
+    24: "24+ rows",
+    30: "30+ rows",
+    40: "40+ rows",
+    _SPACING_NEVER: "never",
+}
 
 #: How many colours to send to the terminal. ``auto`` is the honest default, and it is the
 #: only value that is not a depth. It means "take prompt_toolkit's verdict unless we can
@@ -488,6 +505,36 @@ PREFERENCES: tuple[PrefSpec, ...] = (
         choices=_CONSOLE_FONT_CHOICES,
         platforms=frozenset({"picocalc-lyra"}),
     ),
+    PrefSpec(
+        key="name_overlap_days",
+        label="Shared names",
+        help="Grey a name two nodes used within this many days",
+        group="Display",
+        value_type="int",
+        # A channel message gives only the name of its sender. When two keys used that
+        # name within this window, MeshTerm cannot know which one sent it, and the name
+        # is grey. Outside the window, the key heard most recently gets the name. A larger
+        # value makes more names grey. 0 always gives the name to the newest key.
+        default=NAME_OVERLAP_DAYS,
+        minimum=0,
+        maximum=3650,
+        unit="days",
+    ),
+    PrefSpec(
+        key="section_spacing_min_rows",
+        label="Section spacing",
+        help="A blank line between sections and between chat authors",
+        group="Display",
+        value_type="enum",
+        # The line costs one row for each section. A standard terminal (24 rows) and the
+        # PicoCalc (26) have the rows. The 14 rows of the Cardputer Zero do not: there a
+        # blank line is a row less of the list. The test is the real height of the
+        # terminal, so a small window on a desktop drops the line too (JP, 2026-10-13). It
+        # applies to each section heading of a list, to the day dividers of a chat, and to
+        # the messages of each author in a chat (JP, 2026-10-15).
+        default=24,
+        choices=_SPACING_CHOICES,
+    ),
     # --- Diagnostics ---------------------------------------------------------------
     PrefSpec(
         key="log_level",
@@ -501,6 +548,18 @@ PREFERENCES: tuple[PrefSpec, ...] = (
         default="WARNING",
         choices=_LOG_LEVEL_CHOICES,
         relaunch=True,
+    ),
+    PrefSpec(
+        key="anonymize",
+        label="Anonymize",
+        help="Mask the home folder and addresses in the log and diagnostics",
+        group="Diagnostics",
+        value_type="bool",
+        # Off: the person who reads the log is usually its owner, who needs each detail as
+        # it is. A user who posts the log and the diagnostics in public turns it on (refer
+        # to meshterm.core.anonymize). The log reads it at each record, so a change applies
+        # at once and not at the next start.
+        default=False,
     ),
 )
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared fixtures and helpers: plain-text screen reading, and fixed path rendering.
+"""Shared fixtures and helpers: plain-text screen reading, fixed path rendering, project files.
 
 :func:`plain` is the only way that a test reads a rendered screen. Each screen test must
 first remove the ANSI colour escapes and join the rendered lines. Only then can it make
@@ -18,13 +18,18 @@ powerline pass explicit modes, or they patch the widget's own switch with
 and keeps attributes. This silently makes each colour assertion in the suite useless (a
 shell that an agent harness runs sets it). The autouse fixture below deletes it. Thus the
 tests always see the colours that the app really sends.
+
+:func:`not_ignored` keeps a test that walks a folder to the files of the project. Git
+ignores the other files in the checkout, and these files are not ours to examine.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Callable, Iterable, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -45,6 +50,77 @@ def plain(rendered: str | Iterable[str]) -> str:
     if not isinstance(rendered, str):
         rendered = "\n".join(rendered)
     return _ANSI.sub("", rendered)
+
+
+def recording_locator(markers: list) -> object:
+    """A real :class:`~meshterm.ui.map_screen.Locator` whose map is a list, ``shown``.
+
+    It finds markers with the rule of the app. Instead of a map, :meth:`show` appends the
+    marker that the map would open on to ``shown``.
+    """
+    from meshterm.ui.map_screen import Locator
+
+    class _Recording(Locator):
+        async def show(self, marker) -> None:  # noqa: ANN001 - a MapMarker
+            self.shown.append(marker)
+
+    locator = _Recording(None, markers)  # type: ignore[arg-type]
+    locator.shown = []  # type: ignore[attr-defined]
+    return locator
+
+
+def recording_pages(contacts: list, *, store: object = None, self_key: str = "") -> object:
+    """A real :class:`~meshterm.ui.node_detail_screen.ContactPages` whose pages are a list.
+
+    It finds contacts with the rule of the app. Instead of a node page, :meth:`show` appends
+    the contact that the page would open on to ``shown`` (``None`` is our node). With a
+    contact ``store`` and the key of the device, ^K can lock the contacts too.
+    """
+    from types import SimpleNamespace
+
+    from meshterm.ui.node_detail_screen import ContactPages
+
+    class _Recording(ContactPages):
+        async def show(self, contact) -> None:  # noqa: ANN001 - a Contact, or None for us
+            self.shown.append(contact)
+
+    ctx = None if store is None else SimpleNamespace(contact_store=store)
+    pages = _Recording(ctx, contacts, self_key=self_key)  # type: ignore[arg-type]
+    pages.shown = []  # type: ignore[attr-defined]
+    return pages
+
+
+#: The root of the checkout.
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def not_ignored(paths: Iterable[Path]) -> list[Path]:
+    """The paths in ``paths`` that git does not ignore, in their order.
+
+    A test that walks a folder of the checkout must examine only the files of the project.
+    A folder can also hold files that git ignores. An example is the MeshCore checkout that
+    ``build-firmware.sh`` makes in ``scripts/``, with its third-party code and its build
+    tree. Git never ignores a tracked file. When git is not available (for example, in an
+    unpacked source archive), the function returns all the paths, and the test examines
+    each file, as it did before.
+    """
+    paths = list(paths)
+    relative = [path.resolve().relative_to(_ROOT).as_posix() for path in paths]
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=_ROOT,
+            input="\0".join(relative),
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        )
+    except OSError:
+        return paths
+    if result.returncode not in (0, 1):  # 1 is "nothing ignored", 128 is "not a repository"
+        return paths
+    ignored = set(result.stdout.split("\0"))
+    return [path for path, name in zip(paths, relative, strict=True) if name not in ignored]
 
 
 @pytest.fixture(autouse=True)
@@ -117,6 +193,23 @@ def _isolate_config_dir(tmp_path_factory: pytest.TempPathFactory) -> Iterator[No
         os.environ.pop("MESHTERM_HOME", None)
     else:
         os.environ["MESHTERM_HOME"] = previous
+
+
+@pytest.fixture(autouse=True)
+def _empty_registries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with no registered secret and no registered host.
+
+    The two registries are process-wide on purpose: a secret that MeshTerm read once must
+    stay hidden for the rest of the run. In a suite, that means that a password one test
+    used ("hello", the default room password) hides the same word in each later test that
+    looks for it. ``monkeypatch`` puts the shared objects back after the test.
+    """
+    from meshterm.core import anonymize, secrets
+
+    monkeypatch.setattr(secrets, "_known", set())
+    monkeypatch.setattr(secrets, "_known_pattern", None)
+    monkeypatch.setattr(anonymize, "_hosts", {})
+    monkeypatch.setattr(anonymize, "_host_pattern", None)
 
 
 @pytest.fixture(autouse=True)

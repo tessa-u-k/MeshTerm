@@ -18,7 +18,7 @@ only its direct neighbours:
   **node-type mark** of the app, with its glyph and its colour: the same mark that the
   map and the route graph use for that node. The *identity* of the node is in the name
   next to the marker, in the hue of the node. Edges are braille lines. The median SNR of
-  the link sets the colour of an edge (green → amber → red, and slate for a link with no
+  the link sets the colour of an edge (green → amber → red, and grey for a link with no
   reading), and the age of the evidence makes it fainter. Each edge starts at the *right
   end of the focus name*, so that a line never crosses a label. The fan is on a grid of
   rows: one marker on each row, a blank row between two markers, and a blank row above
@@ -51,7 +51,7 @@ while it fits. If it does not fit, it is *cropped* at each edge where the walk
 continues: the chip breaks on its own half block, the same as each path row in the app
 that is too long for its lane. At rest, the window is at the tail. Thus the focus and the
 last steps are visible, and the crop removes the start of the walk. **←→ slide the
-window**, so that you can read back over a long walk. **^Y** puts the focus on our node
+window**, so that you can read back over a long walk. **^L** puts the focus on our node
 again. **Typing finds**: a filter over all the nodes in the graph, islands also. While you
 type, it also narrows the fan on the canvas to the neighbours that match, and the focus
 stays. Enter teleports the focus to the highlighted match. The trail then starts again
@@ -202,7 +202,7 @@ _SNR_STOPS: tuple[tuple[float, RGB], ...] = (
 
 #: The edge colour for a link with no SNR reading (for example, a link known only from a
 #: route).
-_NO_READING: RGB = (100, 116, 139)
+_NO_READING: RGB = (115, 115, 115)
 
 #: One-letter tags for the types of evidence for a link, the same as in the path composer:
 #: T(race), R(oute), P(acket log), N(eighbour table).
@@ -253,7 +253,7 @@ class WalkScreen(Screen):
         to stand in for *Top* and leave *Bottom* blank to keep up the pretence. Instead, it
         takes a slot of this screen (JP, 2026-08-09), because F1-F3 are for this purpose.
         The Shift bank of the pager then has the same meaning here as in all other places:
-        the two ends of the list that this screen scrolls. On a keyboard, ^Y does the same
+        the two ends of the list that this screen scrolls. On a keyboard, ^L does the same
         action. The map uses the same chord for our node.
 
         The two navigation slots must have rows to move through, and a leaf node in a
@@ -301,7 +301,7 @@ class WalkScreen(Screen):
         self._self_label = self_label
         self._prefix_bytes = prefix_bytes
         #: The walked trail of canonical ids. The focus is its last entry. A walk appends,
-        #: ⌫ pops, ^Y resets the trail to our node, and a find teleport starts it again.
+        #: ⌫ pops, ^L resets the trail to our node, and a find teleport starts it again.
         self._trail: list[str] = [topo.self_id]
         #: The cells by which the breadcrumb line is scrolled off its *tail* end (refer to
         #: :meth:`_trail_text`). 0 is the rest state (the focus at the right edge). Each
@@ -450,7 +450,7 @@ class WalkScreen(Screen):
         atoms = ["↑↓ move"]
         if scrolls:
             atoms.append("←→ trail")
-        atoms += ["Enter focus", "⌫ back", "^Y you"]
+        atoms += ["Enter focus", "⌫ back", "^L you"]
         if not scrolls:
             atoms.append("type to find")
         atoms.append("Esc back")
@@ -460,7 +460,7 @@ class WalkScreen(Screen):
         """Move the highlight, walk, step back, find, or close.
 
         Home/End go to the ends of the list here, the same as on each other screen that
-        scrolls. The jump back to our node is ``locate`` (^Y, and F3 on the lane), which is
+        scrolls. The jump back to our node is ``locate`` (^L, and F3 on the lane), which is
         not a position in this list. Refer to :attr:`picocalc_lyra_lane`.
         """
         rows = self._rows()
@@ -512,7 +512,7 @@ class WalkScreen(Screen):
         elif action == "right":
             self._trail_scroll = max(0, self._trail_scroll - _HSCROLL_STEP)
         elif action == "locate":
-            # ^Y (and F3): stop the walk, instead of a move inside it. The trail goes back
+            # ^L (and F3): stop the walk, instead of a move inside it. The trail goes back
             # to only our node, and a find that narrows the list is also removed.
             self._trail = [self._topo.self_id]
             self._filter = ""
@@ -676,7 +676,7 @@ class WalkScreen(Screen):
         is measured only when the two marks are known, or the line draws one cell past the
         row. The slide stops when the head becomes visible, so the line does not move off
         the edge. Each change to the trail resets the slide: a walk, a step back, a
-        teleport, and ^Y all end with the focus visible, because the user reads the next
+        teleport, and ^L all end with the focus visible, because the user reads the next
         move from there.
         """
         self._trail_width = width
@@ -864,7 +864,7 @@ class WalkScreen(Screen):
         # The edge of the selected link is the brightest and is on top. It does not get
         # the age fade, so it shows as one lit line over the dimmer others. (The user can
         # still read the age in the age column of the row.) The edge of the collapsed
-        # marker is slate. But when the selection is one of its nodes, it becomes the
+        # marker is grey. But when the selection is one of its nodes, it becomes the
         # edge of that node.
         now = utcnow()
         for other, (x, y) in placed.items():
@@ -1387,9 +1387,8 @@ class WalkScreen(Screen):
         The walk once gave each marker the colour of its identity (the hue of the node,
         from its key), and only the glyph shape showed the type. Thus this canvas was
         different from each other place that shows a node with its type (the map, the
-        route graph, a contact row). There, the colour of the mark *is* the type, and the
-        ``type.*`` styles of the theme select it on purpose for each platform (a simple
-        downsample makes the violet of the repeater grey). The identity has its own lane
+        route graph, a contact row). There, the mark *is* the type, in the ``type.*`` styles
+        of the theme, which each platform resolves for itself. The identity has its own lane
         here, and always had it: the **name** next to the marker, in the hue of the key
         (:meth:`_label_rgb`). The shape and the colour now agree, and the legend under the
         canvas can explain both.
@@ -1416,7 +1415,7 @@ class WalkScreen(Screen):
         """The Rich style of the type glyph of a node in body text: the colour of its type.
 
         This is the text form of :meth:`_marker_rgb`: the same ``type.*`` entry (or the
-        yellow of the star). Thus the first glyph of the focus line, the glyphs of the list
+        white of our star). Thus the first glyph of the focus line, the glyphs of the list
         rows, and the canvas markers are one mark, drawn in three ways.
         """
         return self._glyph(node)[1]
@@ -1441,11 +1440,11 @@ class WalkScreen(Screen):
 
         These are the shared marks (:data:`~meshterm.ui.widgets.NODE_GLYPHS`) and the
         shared ``type.*`` colours for them. Thus a node shows here with exactly the glyph
-        and colour that the map, the route graph, and the contact list use for it: ``▲``
-        violet for a repeater, ``■`` for a room, ``◉`` for a sensor, ``●`` pink for a
-        plain node, the yellow ``★`` for our node, and the grey ``○`` for a node that we
-        heard of but never identified. The colour and the shape say the same thing. Thus
-        the legend below the canvas is a real explanation, not a coincidence.
+        and colour that the map, the route graph, and the contact list use for it: a white
+        ``▲`` for a repeater, ``■`` for a room, ``◉`` for a sensor, ``●`` for a plain node,
+        ``★`` for our node, and the grey ``○`` for a node that we heard of but never
+        identified. Thus the legend below the canvas is a real explanation, not a
+        coincidence.
 
         Returns:
             ``(glyph, colour)``: the colour in the encoding that

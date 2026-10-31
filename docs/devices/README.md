@@ -15,7 +15,7 @@ has its own manual with numbered steps. This page tells you which manual is your
 | a ClockworkPi **PicoCalc**, stock or already running Calculinux on a Luckfox Lyra, and I want MeshTerm on its own display | **[MeshTerm on the PicoCalc](picocalc-lyra.md)**: from the shopping list to a working machine |
 | …and I want a **radio** inside it | the same manual, [Phase 3](picocalc-lyra.md#phase-3-add-the-radio): a XIAO nRF52840 + Wio-SX1262 soldered to the UART of the Lyra |
 | a ClockworkPi **uConsole** with the hackergadgets AIO board (an SX1262 on the SPI bus of the host) | **[MeshTerm on the uConsole](uconsole.md)**: MeshTerm drives the radio directly with `--spi`. A bridge service can also present the radio as a companion, if you want it always on |
-| an M5Stack **Cardputer Zero**, the one with a Raspberry Pi inside (not the ESP32 Cardputer or the Cardputer-Adv) | **[MeshTerm on the Cardputer Zero](cardputer-zero.md)**: ⚠️ **not supported yet**. MeshTerm has never run on the handheld. The page tells you what works in the emulator |
+| an M5Stack **Cardputer Zero** or **Cardputer Zero Lite**, the models with a Raspberry Pi inside (not the ESP32 Cardputer or the Cardputer-Adv) | **[MeshTerm on the Cardputer Zero](cardputer-zero.md)**: install MeshTerm from M5Stack's app store. MeshTerm drives the Cap LoRa-1262 directly, or it uses a companion |
 | a MeshCore companion on USB, Bluetooth, or Wi-Fi | nothing here. Read the [README](../../README.md). If the companion does not connect, read [When a companion does not connect](../guide/connecting.md) |
 
 The handhelds have nothing in common except MeshTerm. Each manual runs scripts on the
@@ -52,6 +52,7 @@ the machine, and why each step is as it is. On the Lyra, only one program can ho
 | [`xiao-radio/build-firmware.sh`](../../scripts/picocalc-lyra/xiao-radio/build-firmware.sh) | development machine | Clones and patches MeshCore, builds the `Xiao_nrf52_companion_radio_serial` environment, and makes the `.uf2` file. |
 | [`xiao-radio/flash.py`](../../scripts/picocalc-lyra/xiao-radio/flash.py) | development machine | Flashes the `.uf2` file to the XIAO through its UF2 bootloader. It refuses the wrong board or SoftDevice. When the bootloader gives no drive, it prints the serial-DFU command. |
 | [`xiao-radio/meshcore-uart1.patch`](../../scripts/picocalc-lyra/xiao-radio/meshcore-uart1.patch) | none | The two firmware hunks: the companion on `Serial1` of the nRF52, and I²C moved off the UART pads. It is not upstream yet. |
+| [`xiao-radio/meshcore-frame-timeout.patch`](../../scripts/picocalc-lyra/xiao-radio/meshcore-frame-timeout.patch) | none | The serial parser of the companion drops a frame whose bytes stop for 200 ms. Thus one lost byte cannot make the radio ignore each command after it. It is not upstream yet. |
 | [`xiao-radio/lyra-setup.sh`](../../scripts/picocalc-lyra/xiao-radio/lyra-setup.sh) | the Lyra (root) | A UART1 → GP4/GP5 mux service that stays after a reboot, membership of `dialout`, and a default MeshTerm serial profile for `/dev/ttyS1`. |
 | [`xiao-radio/uart1-mux.py`](../../scripts/picocalc-lyra/xiao-radio/uart1-mux.py) | the Lyra (root) | The matrix-IO register poke that routes UART1 to the header pads. The service above runs it once at each boot. |
 | [`uconsole/meshterm-spi-bridge`](../../scripts/uconsole/meshterm-spi-bridge) | the radio host (your user) | The **always-on** option. It runs a mesh node in software over an SX1262 on an SPI bus (uConsole AIO, Waveshare HATs). It serves the companion protocol on `127.0.0.1:5000`. Thus the node stays on the mesh while MeshTerm is closed. It has a setup menu, a preflight check, and an optional `systemd --user` service. It runs on `openhop_core` (preferred) or on its predecessor `pymc_core`. The manual describes the venv that it needs on a bookworm uConsole. Most users must use `meshterm --spi` instead. It needs no script and no service, and MeshTerm drives the chip itself while MeshTerm runs. |
@@ -77,8 +78,10 @@ meshterm platform                          # which platform this terminal resolv
 ```
 
 The **cardputer-zero** platform is the display of the Cardputer Zero, which is 53×14.
-MeshTerm draws this display itself. The platform is [not supported yet](cardputer-zero.md),
-thus MeshTerm never detects it. Only `--platform cardputer-zero` selects it.
+MeshTerm draws this display itself. MeshTerm does not detect this platform. On the
+handheld, the launcher starts MeshTerm's own console, and the console selects the platform
+(refer to [the Cardputer Zero page](cardputer-zero.md)). On another computer,
+`--platform cardputer-zero` selects it.
 
 The platform needs two things from the console: a font that has the glyphs that the
 interface draws, and the stock sixteen-slot palette. The setup script in the PicoCalc

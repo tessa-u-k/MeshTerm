@@ -27,22 +27,25 @@ run MeshTerm, the more the history of your mesh is worth.
 > change something, first say hello on [Discord](https://discord.gg/AZwe5Uvb3S).
 > [Read more about how the project is run](#how-this-project-is-run).
 
-https://github.com/user-attachments/assets/f91a6695-14d5-4ae0-8fdc-e65492d0955d
+https://github.com/user-attachments/assets/9921c756-c096-4224-9560-bb6180d895c8
 
-<p align="center"><sub>A video of less than two minutes, made on a real mesh.</sub></p>
+<p align="center"><sub>A video of less than two minutes, in the demo mesh over Montréal (<code>meshterm --demo</code>).</sub></p>
 
 <p align="center">
-  <img src="docs/screenshots/dashboard.png" alt="The dashboard: a timeline of the packets for each minute over the last two hours, and a count for each class of packet" width="49%">
-  <img src="docs/screenshots/map.png" alt="The map: repeaters with their names, on an OpenStreetMap basemap of the Lachine Canal" width="49%">
+  <img src="docs/screenshots/terminal/menu.png" alt="The main menu: the tools in groups (Message, Watch, Explore), and a header that shows one unread message and three alerts" width="49%">
+  <img src="docs/screenshots/terminal/chat.png" alt="The chat on the Public channel: each sender in a chip of the colour of their key, with the time and the SNR of each message" width="49%">
 </p>
 <p align="center">
-  <img src="docs/screenshots/trace.png" alt="A trace: the route that the trace went through, drawn as chips, then the SNR of each hop" width="49%">
-  <img src="docs/screenshots/path.png" alt="Message paths: each route over which a channel message was heard, drawn on the map" width="49%">
+  <img src="docs/screenshots/terminal/paths.png" alt="Message paths: the five paths on which one channel message arrived, drawn as a graph and as chips" width="49%">
+  <img src="docs/screenshots/terminal/map.png" alt="The map: the nodes of the demo mesh over Montréal, with their names, on an OpenStreetMap basemap" width="49%">
 </p>
 <p align="center">
   <img src="docs/screenshots/picocalc.png" alt="MeshTerm on the PicoCalc, a console that is 53 columns wide, with a radio installed inside it" width="38%">
 </p>
-<p align="center"><sub>The dashboard, the map, a trace, the paths of a message, and the whole app on a PicoCalc.</sub></p>
+<p align="center">
+  <img src="docs/screenshots/cardputer-zero.png" alt="MeshTerm on the display of a Cardputer Zero: the wordmark, then the list of devices, with the Cap LoRa-1262 at the top" width="60%">
+</p>
+<p align="center"><sub>The main menu, the chat, the paths of a message, and the map, in the demo mesh over Montréal (<code>meshterm --demo</code>). Then the whole app on a PicoCalc, and the start screen on a Cardputer Zero.</sub></p>
 
 ---
 
@@ -195,6 +198,12 @@ pipx install git+https://github.com/jpmartineau/MeshTerm
 **Do you not have a radio yet?** `meshterm --mock` runs the complete app on a simulated
 mesh. You can look at the app before you buy anything.
 
+### On the Cardputer Zero
+
+Install MeshTerm from M5Stack's app store on the handheld. Its share code is `MTRM`.
+MeshTerm works on both models, the Cardputer Zero and the Cardputer Zero Lite.
+[MeshTerm on the Cardputer Zero](docs/devices/cardputer-zero.md) has the details.
+
 ### Coming
 
 **`pip install mesh-term`** will work after the package is published. It is not published
@@ -215,7 +224,7 @@ code survey, which we keep as a historical record. This table is a short version
 | [The CLI cookbook](docs/cli/cookbook.md) | Common one-line commands, in groups by the task that you want to do. |
 | [Configuring MeshTerm](docs/guide/configuration.md) | The preferences, the device profiles, and all the files that MeshTerm keeps in `~/.meshterm`. |
 | [When a companion does not connect](docs/guide/connecting.md) | Bluetooth pairing on each system, how to find the PIN, USB permissions, and each connection error, with the action to take. |
-| [MeshTerm on hardware](docs/devices/README.md) | Which handheld manual is the correct one for you: the [PicoCalc](docs/devices/picocalc-lyra.md) build, or the [uConsole](docs/devices/uconsole.md), whose LoRa chip MeshTerm can control directly. The [Cardputer Zero](docs/devices/cardputer-zero.md) is **not supported yet**. |
+| [MeshTerm on hardware](docs/devices/README.md) | Which handheld manual is the correct one for you: the [PicoCalc](docs/devices/picocalc-lyra.md) build, the [uConsole](docs/devices/uconsole.md), whose LoRa chip MeshTerm can control directly, or the [Cardputer Zero](docs/devices/cardputer-zero.md), which gets MeshTerm from M5Stack's app store. |
 | [How the code is laid out](docs/development/architecture.md) | The layers of the code, and where to put a new feature. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The development setup and the house rules. |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, with the newest change first. |
@@ -243,6 +252,10 @@ meshterm --mock
 # custom console font, and an F-key hint lane. Preview it anywhere, or inspect it:
 meshterm --mock --platform picocalc-lyra
 meshterm specimen
+
+# On a Cardputer Zero, MeshTerm draws its 53×14 display itself. See that display in a
+# window of its own (download its font once with `meshterm emulate --fetch-fonts`):
+meshterm emulate cardputer-zero --mock
 ```
 
 MeshTerm has its own manuals for handhelds. **[MeshTerm on the
@@ -250,10 +263,11 @@ PicoCalc](docs/devices/picocalc-lyra.md)** goes from the shopping list for a sto
 to a Linux handheld that has a LoRa radio soldered inside. **[MeshTerm on the
 uConsole](docs/devices/uconsole.md)** shows how to control the SPI LoRa board of a uConsole
 directly with `--spi`. It also shows how to use a small bridge, if you want the node to be
-on the mesh at all times. M5Stack's Cardputer Zero also has a page, but it is **[not
-supported yet](docs/devices/cardputer-zero.md)**. The scripts that the manuals run on the
-device are in [`scripts/`](scripts/). If you do not know which manual is correct for you,
-refer to [`docs/devices/README.md`](docs/devices/README.md).
+on the mesh at all times. **[MeshTerm on the Cardputer
+Zero](docs/devices/cardputer-zero.md)** shows how to install MeshTerm from M5Stack's app
+store. On that handheld, MeshTerm drives the Cap LoRa-1262 radio directly. The scripts
+that the manuals run on the device are in [`scripts/`](scripts/). If you do not know which
+manual is correct for you, refer to [`docs/devices/README.md`](docs/devices/README.md).
 
 Does a companion not connect? **[When a companion does not
 connect](docs/guide/connecting.md)** explains Bluetooth pairing on Windows, Linux, and
