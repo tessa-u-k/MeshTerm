@@ -29,7 +29,15 @@ from ..core import links
 from ..core.channels import MENTION, split_channel_sender
 from ..core.connection import ContactNotOnDeviceError
 from ..core.events import EventKind, MeshEvent
-from ..core.models import ChatMessage, Contact, Conversation, Message, utcnow
+from ..core.models import (
+    NODE_TYPE_CHAT,
+    ChatMessage,
+    Contact,
+    Conversation,
+    Message,
+    clock_tolerance_s,
+    utcnow,
+)
 from ..core.regions import WILDCARD
 from ..platforms import Platform, on_platform
 from .compose import MentionEditor
@@ -48,6 +56,7 @@ from .widgets import (
     DESTINATION,
     ORIGIN,
     author_chip,
+    format_offset,
     hop_chip,
     mention_hop,
     mention_mark,
@@ -57,10 +66,16 @@ from .widgets import (
 
 if TYPE_CHECKING:
     from ..context import AppContext
+    from ..services.message_paths import TraceWalk
     from .map_render import MapMarker
     from .map_screen import Locator
     from .node_detail_screen import ContactPages
 
+
+#: The mark after a corrected time: the clock of the sender was wrong, so the line shows
+#: the arrival time instead (JP, 2026-11-02). It is the ``?`` warn mark of the app, and it
+#: takes the first of the two cells after the time, so the bodies stay in one column.
+_CORRECTED = ("?", "warn")
 
 #: The delivery marks for a *resolved* outbound direct message, at the end of its line:
 #: acknowledged, or transmitted but not acknowledged (^R can retry it). These are the
@@ -266,6 +281,7 @@ class ChatScreen(Screen):
         pages: ContactPages | None = None,
         self_name: str | None = None,
         self_key: str | None = None,
+        resend_flood: Callable[[ChatMessage], Awaitable[ChatMessage]] | None = None,
     ) -> None:
         """Build the chat screen.
 
@@ -306,6 +322,9 @@ class ChatScreen(Screen):
             self_name: The name of our node (refer to :func:`our_node`). Our messages and
                 the mentions of our name show it (:func:`~meshterm.ui.widgets.self_chip`).
             self_key: Our public key, which gives the hue of that chip.
+            resend_flood: Like ``resend``, but it first forgets the route that the device
+                learned to the contact, so that the retry floods (direct chats only).
+                With ``None``, ^R always retries on the route, as it did before.
         """
         super().__init__()
         self._self_name = self_name
@@ -333,6 +352,8 @@ class ChatScreen(Screen):
         self._messages = list(messages)
         self._send = send
         self._resend = resend
+        self._resend_flood = resend_flood if not conversation.is_channel else None
+        self._route_contact = contact
         self._resend_unscoped = resend_unscoped if conversation.is_channel else None
         self._paths = paths
         self._locator = locator
@@ -354,6 +375,7 @@ class ChatScreen(Screen):
         self._codes_open = False  # one share screen of links at a time
         self._paste_open = False  # one paste-confirm dialog at a time
         self._resend_open = False  # one resend-unscoped confirm at a time
+        self._retry_open = False  # one route-or-flood choice at a time
         # The selection: the index of the highlighted message (or None when the compose
         # line has the focus), and the body line where it rendered, so that the frame keeps
         # it visible.
@@ -367,6 +389,8 @@ class ChatScreen(Screen):
         # animation step of a spinner) renders again only the rows that changed. Refer to
         # _render_grouped.
         self._render_cache: dict | None = None
+        # The clock tolerance of the last render: which times show as corrected.
+        self._tolerance_s = clock_tolerance_s()
         # Strong references to the sends, resends, and spinner tickers that a key handler
         # starts. The event loop holds only a *weak* reference. Thus the garbage collector
         # can remove a task that nothing else names while it runs: the result is a message
@@ -633,7 +657,8 @@ class ChatScreen(Screen):
 
         A change of the locks draws all of the transcript again, because the sender chip of
         a locked contact has a padlock (refer to :meth:`_group_header`). The locks change
-        rarely: ^K here, or the lock row of the node page of an author.
+        rarely: ^K here, or the lock row of the node page of an author. A change of the
+        clock tolerance does the same, because it decides which times are corrected.
 
         Most importantly, this works for each message. It is not a cached prefix that
         stops at the first such row. Thus a message stays cheap to draw again, however far
@@ -647,11 +672,14 @@ class ChatScreen(Screen):
         cache = self._render_cache
         spacing = self.section_spacing()
         locks = self._pages.locked_keys() if self._pages is not None else frozenset()
+        tolerance = clock_tolerance_s()
+        self._tolerance_s = tolerance
         if (
             cache is not None
             and cache["width"] == width
             and cache["spacing"] == spacing
             and cache["locks"] == locks
+            and cache["tolerance"] == tolerance
         ):
             cached_ids = cache["ids"]
             cached_acked = cache["acked"]
@@ -683,7 +711,10 @@ class ChatScreen(Screen):
 
         for idx in range(total):
             message = messages[idx]
-            stamp = message.created_at.astimezone()
+            # The time that the message shows: its sender time, or its arrival time when
+            # the clock of the sender is wrong. The day divider follows the same time, so
+            # a sender with a wrong clock never puts a day from another year in the middle.
+            stamp = message.shown_at(tolerance).astimezone()
             day = stamp.date()
             sender, body = self._sender_and_body(message)
             # Group by (are-we-the-sender, display name), not by the name alone. Thus our
@@ -754,6 +785,7 @@ class ChatScreen(Screen):
             "width": width,
             "spacing": spacing,
             "locks": locks,
+            "tolerance": tolerance,
             "ids": ids,
             "acked": ackeds,
             "selected": selecteds,
@@ -788,7 +820,7 @@ class ChatScreen(Screen):
             return None
 
         def group_of(message: ChatMessage) -> tuple:
-            day = message.created_at.astimezone().date()
+            day = message.shown_at(self._tolerance_s).astimezone().date()
             return (day, message.outbound, self._sender_and_body(message)[0])
 
         group = group_of(messages[selected])
@@ -872,8 +904,15 @@ class ChatScreen(Screen):
         body gets a QR code under it. The codes are side by side, at the indent of the
         body. Thus the user can open a link from the handheld on a phone, and does not
         have to type it.
+
+        When the clock of the sender is wrong (:meth:`~meshterm.core.models.ChatMessage.corrected`),
+        the line shows the arrival time, with the ``?`` mark after it. On the selected
+        message, a line under the body then gives the time that the sender's clock wrote,
+        and how far that clock is off (JP, 2026-11-02).
         """
-        stamp = message.created_at.astimezone()
+        tolerance = self._tolerance_s
+        corrected = message.corrected(tolerance)
+        stamp = message.shown_at(tolerance).astimezone()
         prefix = Text()
         prefix.append("❯ " if selected else "  ", style="cursor" if selected else None)
         if self._names_us(body):
@@ -881,7 +920,12 @@ class ChatScreen(Screen):
             prefix.append(" ")
         else:
             prefix.append("  ")
-        prefix.append(f"{stamp:%H:%M}  ", style="cursor" if selected else "muted")
+        prefix.append(f"{stamp:%H:%M}", style="cursor" if selected else "muted")
+        if corrected:
+            prefix.append(*_CORRECTED)
+        else:
+            prefix.append(" ")
+        prefix.append(" ")
         body_text = self._body_text(body, message, selected=selected)
         whole = [m.span() for m in _WORD.finditer(body_text.plain) if links.urls(m.group())]
         # A mention is a chip, and a chip never breaks across two lines.
@@ -889,6 +933,16 @@ class ChatScreen(Screen):
         lines = render_hanging(
             prefix, body_text, width, indent=prefix.cell_len, whole=whole, gutter=_URL_GUTTER
         )
+        if selected and corrected and message.clock_offset_s is not None:
+            sent = message.created_at.astimezone()
+            note = Text()
+            note.append(f"{_CORRECTED[0]} ", style=_CORRECTED[1])
+            note.append(
+                f"its clock: {sent:%Y-%m-%d %H:%M} · {format_offset(message.clock_offset_s)}",
+                style="muted",
+            )
+            indent = prefix.cell_len
+            lines += render_hanging(Text(" " * indent), note, width, indent=indent)
         urls = links.urls(body) if _URL_CODES else []
         if urls:
             lines += render_lines(qr_strip(urls, width, indent=prefix.cell_len), width)
@@ -1386,7 +1440,7 @@ class ChatScreen(Screen):
         starts: list[int] = []
         prev_day = None
         for i, message in enumerate(self._messages):
-            day = message.created_at.astimezone().date()
+            day = message.shown_at(self._tolerance_s).astimezone().date()
             if day != prev_day:
                 starts.append(i)
                 prev_day = day
@@ -1562,17 +1616,90 @@ class ChatScreen(Screen):
             None,
         )
 
+    def _went_by_route(self, message: ChatMessage) -> bool:
+        """Whether the last transmission of ``message`` went along a learned route.
+
+        The device tells how it sent the message (:attr:`ChatMessage.flood`). A message
+        that is loaded from the history has no such fact. For that message, the answer
+        comes from the contact: a contact with a route is sent to along that route. Thus
+        the answer is ``False`` when no flood retry is connected.
+        """
+        if self._resend_flood is None:
+            return False
+        if message.flood is not None:
+            return not message.flood
+        contact = self._route_contact
+        return contact is not None and contact.route_hops is not None
+
     def _retry(self) -> None:
-        """Try again to deliver the most recent unacknowledged direct message (Ctrl-R)."""
+        """Try again to deliver the most recent unacknowledged direct message (Ctrl-R).
+
+        A message that went along the learned route gets a choice first
+        (:meth:`_begin_retry_choice`). The route is the most common cause of a message
+        that is lost with no error, and a retry on the same route fails in the same way.
+        A message that already went by flood is sent again at once, with no question.
+        """
         target = self._retry_target()
-        if target is None:
+        if target is None or self._retry_open:
             return
+        if self._went_by_route(target):
+            self._begin_retry_choice(target)
+            return
+        self._start_retry(target, flood=False)
+
+    def _start_retry(self, target: ChatMessage, *, flood: bool) -> None:
+        """Send ``target`` again, one time, on the route or (with ``flood``) by flood."""
         self._sending = True
         target.acked = None  # back to the spinner while the retry is in flight
-        self._status = "retrying…"
+        self._status = "retrying by flood…" if flood else "retrying…"
         self._stick = True
         self._session.invalidate()
-        self._spawn(self._resend_message(target))
+        self._spawn(self._resend_message(target, flood=flood))
+
+    def _begin_retry_choice(self, target: ChatMessage) -> None:
+        """Ask whether to retry on the learned route or by flood, then send one time (^R).
+
+        The companion keeps one route for each contact and never forgets a route that is
+        no longer valid. Thus a message on a dead route gets no ack, and each retry on that
+        route fails in the same way (GitHub issue 34). A flood goes around the route, and
+        the companion learns a new one from the answer. A flood reaches each repeater in
+        range, so it is the choice of the user, never a default of the program. The
+        buttons follow the dialog standard: the safe way out on the left, and the
+        committing choice on the right, which is also the default. Either choice is the
+        one transmission.
+        """
+        self._retry_open = True
+        preview = target.text if len(target.text) <= 32 else target.text[:31] + "…"
+
+        async def run() -> None:
+            try:
+                choice = await self._session.button_dialog(
+                    Text(
+                        f"“{preview}” got no ack on the route that your radio learned. A "
+                        "route goes stale when the mesh changes. Send it again on the "
+                        "route, or by flood?"
+                    ),
+                    [("Cancel", None), ("On route", "route"), ("By flood", "flood")],
+                    title="Retry",
+                    default=2,
+                    footer_hint="←→ choose · Enter select · Esc cancel",
+                )
+            finally:
+                self._retry_open = False
+            # A late ack can settle the message while the dialog is up. Then nothing remains
+            # to send.
+            usable = (
+                choice in ("route", "flood")
+                and not self._sending
+                and self._resend is not None
+                and target.acked is False
+            )
+            if not usable or (choice == "flood" and self._resend_flood is None):
+                self._session.invalidate()
+                return
+            self._start_retry(target, flood=choice == "flood")
+
+        self._spawn(run())
 
     def _begin_resend_unscoped(self) -> None:
         """Confirm, then send a scoped channel message again, unscoped (^R).
@@ -1631,16 +1758,31 @@ class ChatScreen(Screen):
 
         self._spawn(run())
 
-    async def _resend_message(self, message: ChatMessage) -> None:
-        """Run a retry to its end, and refresh the delivery state of the message in place."""
+    async def _resend_message(self, message: ChatMessage, *, flood: bool = False) -> None:
+        """Run a retry to its end, and refresh the delivery state of the message in place.
+
+        With ``flood``, the retry first forgets the route of the contact (the
+        ``resend_flood`` callable). If the retry still gets no ack, the status line says
+        that ^R can try again. It also names the flood choice when the last send went
+        along the route.
+        """
         assert self._resend is not None
         try:
-            await self._spin_while(self._resend(message))
+            if flood:
+                assert self._resend_flood is not None
+                await self._spin_while(self._resend_flood(message))
+            else:
+                await self._spin_while(self._resend(message))
         except Exception as exc:  # noqa: BLE001 - show the error inline, keep the chat open
             message.acked = False
             self._status = f"retry failed: {exc}"
         else:
-            self._status = "" if message.acked else "still no ack — ^R to retry"
+            if message.acked:
+                self._status = ""
+            elif self._went_by_route(message):
+                self._status = "still no ack — ^R to retry on the route or by flood"
+            else:
+                self._status = "still no ack — ^R to retry"
         finally:
             self._sending = False
             self._stick = True
@@ -1756,6 +1898,16 @@ async def open_chat(ctx: AppContext, conversation: Conversation) -> int:
                 ctx, lambda: ctx.chat.resend_direct(conversation.contact, message)
             )
 
+    resend_flood: Callable[[ChatMessage], Awaitable[ChatMessage]] | None = None
+    if not conversation.is_channel:
+
+        async def resend_flood(message: ChatMessage) -> ChatMessage:
+            assert conversation.contact is not None
+            return await _with_restore(
+                ctx,
+                lambda: ctx.chat.resend_direct(conversation.contact, message, flood=True),
+            )
+
     from .map_screen import Locator
     from .node_detail_screen import ContactPages
 
@@ -1776,6 +1928,7 @@ async def open_chat(ctx: AppContext, conversation: Conversation) -> int:
         pages=await ContactPages.gather(ctx, self_key=self_key or ""),
         self_name=self_name,
         self_key=self_key,
+        resend_flood=resend_flood,
     )
     ctx.chat.set_active(conversation.key)
 
@@ -1949,6 +2102,78 @@ def _sent_scope_line(ctx: AppContext, message: ChatMessage, *, relayed: bool) ->
     return line
 
 
+async def _trace_walk(
+    ctx: AppContext,
+    walk: TraceWalk,
+    *,
+    contacts: list[Contact],
+    label: str | None,
+    node_type: int | None = None,
+) -> None:
+    """Open the trace screen armed on the walk of one arrival, and run it until the user leaves.
+
+    The screen opens idle, armed on the route. Nothing transmits until the user starts a
+    trace there. A walk to a node opens *Trace target* on that node. Thus the rules for a
+    target apply: a node that does not relay a trace (a companion) is not the turn of the
+    walk, and the walk turns at the last relay before it (refer to
+    :func:`~meshterm.core.models.relays_traces`). The spec is the route out, the turn, and
+    the mirror of the route back (:func:`~meshterm.services.topology.render_forced_spec`).
+    A loop opens *Trace path* on the walk as given. The width of each hop is the routing
+    width of the device, collapsed to what a trace can encode, the same as the trace
+    screen uses.
+
+    Args:
+        ctx: The shared application context.
+        walk: The walk of the arrival (refer to
+            :func:`~meshterm.services.message_paths.trace_walk`).
+        contacts: The contacts of the device. A target that is a contact opens under the
+            name of that contact, the same as from its node page. Thus the history of its
+            traces stays in one place.
+        label: The name of the target node, for a target that is not a contact. A walk to
+            a node with no key opens under this name, so it must have one.
+        node_type: The type of the target, when the caller knows it from the message (the
+            sender of channel text is a companion). The screen uses it when MeshTerm has no
+            stored type for the target.
+    """
+    from ..services.topology import render_custom_spec, render_forced_spec
+    from .trace_screen import collapse_trace_width, open_trace, open_trace_path
+
+    try:
+        width = collapse_trace_width(int(await ctx.devstate.path_hash_mode()))
+    except Exception:  # noqa: BLE001 - an optional read. The 1-byte default always works.
+        width = 1
+    if walk.loop:
+        await open_trace_path(ctx, render_custom_spec(walk.hops, width))
+        return
+    if walk.target is None:
+        assert label, "a walk to a node with no key opens under its name"
+        # No hash addresses a node with no key, so the walk turns at the last relay of the
+        # route. The caller offers such a walk only for a node that does not relay.
+        await open_trace(
+            ctx,
+            label,
+            initial_spec=render_custom_spec((*walk.hops, *reversed(walk.hops[:-1])), width),
+            label=label,
+            node_type=node_type,
+        )
+        return
+    key = walk.target.lower()
+
+    def holds(contact: Contact) -> bool:
+        # A key prefix and a full key name the same node, in either order.
+        own = (contact.public_key or contact.key_prefix or "").lower()
+        return bool(own) and (own.startswith(key) or key.startswith(own))
+
+    contact = next((c for c in contacts if holds(c)), None)
+    await open_trace(
+        ctx,
+        contact.name if contact is not None else key,
+        initial_spec=render_forced_spec(walk.hops, key, width),
+        label=label,
+        node_type=node_type,
+    )
+
+
 async def _make_paths_presenter(
     ctx: AppContext,
     conversation: Conversation,
@@ -1972,16 +2197,22 @@ async def _make_paths_presenter(
         conversation: The conversation that the chat screen opens.
         device: The connected device (the caller already awaited it).
 
+    The window stays pushed while the user traces a route from it (Enter on an arrival).
+    The trace screen opens above it, and Esc from the trace comes back to the same window,
+    with its highlight.
+
     Returns:
         An async callable that shows the paths of one message in a floating window.
     """
     from ..services import trace_runner
     from ..services.message_paths import (
+        Arrival,
         channel_arrivals,
         collapse,
         direct_arrivals,
         distinct_paths,
         message_scope,
+        trace_walk,
     )
     from .message_paths_screen import MessagePathsScreen
 
@@ -2007,6 +2238,7 @@ async def _make_paths_presenter(
             secret = None
 
     async def present(message: ChatMessage) -> None:
+        peer_key: str | None = None
         if conversation.is_channel and secret:
             arrivals = channel_arrivals(
                 ctx.repo, message, channel_name=conversation.label, secret=secret
@@ -2073,22 +2305,60 @@ async def _make_paths_presenter(
             source, _body = split_channel_sender(message.text)
         else:
             source = conversation.label
-        await session.run_screen(
-            MessagePathsScreen(
-                message,
-                arrivals,
-                matched=matched,
-                resolve=resolve,
-                prefix_bytes=prefix_bytes,
-                self_name=self_name,
-                summary=summary,
-                source=source or None,
-                destination=destination or None,
-                type_of=type_of,
-                key_of=key_of,
-                scope=message_scope(arrivals, ctx.region_store.scope_of),
-                sent_scope=_sent_scope_line(ctx, message, relayed=bool(arrivals)),
+        # The keys of the two ends, for a trace of a route (refer to trace_walk). The peer
+        # of a direct chat is the recipient of our sends and the sender of what we receive.
+        # A channel message names its sender only by name, and the key comes from that name.
+        if message.outbound:
+            origin_key = None
+            far_key = None if conversation.is_channel else peer_key
+        elif conversation.is_channel:
+            origin_key = key_of(source) if source else None
+            far_key = None
+        else:
+            origin_key, far_key = peer_key, None
+        # Only a companion sends channel text. Thus the sender of a channel message does
+        # not relay a trace, also when MeshTerm never heard its advert.
+        sender_type = NODE_TYPE_CHAT if conversation.is_channel and not message.outbound else None
+
+        def walk_of(arrival: Arrival) -> TraceWalk | None:
+            walk = trace_walk(
+                arrival, outbound=message.outbound, origin_key=origin_key, far_key=far_key
             )
+            # A walk to a sender with no key turns at its last relay. That is correct only
+            # for a node that does not relay, and the screen must have a name to show.
+            if walk is not None and walk.target is None and not walk.loop:
+                if sender_type is None or not source:
+                    return None
+            return walk
+
+        screen = MessagePathsScreen(
+            message,
+            arrivals,
+            matched=matched,
+            resolve=resolve,
+            prefix_bytes=prefix_bytes,
+            self_name=self_name,
+            summary=summary,
+            source=source or None,
+            destination=destination or None,
+            type_of=type_of,
+            key_of=key_of,
+            scope=message_scope(arrivals, ctx.region_store.scope_of),
+            sent_scope=_sent_scope_line(ctx, message, relayed=bool(arrivals)),
+            can_trace=lambda arrival: walk_of(arrival) is not None,
         )
+        # A hub, not a one-time dialog: each Enter traces one route above the window, and
+        # the window stays with its highlight for the next one.
+        async with session.stay(screen) as visit:
+            while True:
+                chosen = await visit.result()
+                if not isinstance(chosen, Arrival):
+                    return
+                walk = walk_of(chosen)
+                if walk is not None:
+                    label = destination if message.outbound else source
+                    await _trace_walk(
+                        ctx, walk, contacts=contacts, label=label or None, node_type=sender_type
+                    )
 
     return present

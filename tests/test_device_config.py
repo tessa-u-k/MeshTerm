@@ -250,9 +250,9 @@ async def test_contacts_tool_opens_sorted_by_heard(monkeypatch: pytest.MonkeyPat
     captured: dict = {}
     real_order = widgets.ordered_contacts
 
-    def fake_order(contacts, counts, sort):  # noqa: ANN001, ANN202
+    def fake_order(contacts, counts, sort, place_of=None):  # noqa: ANN001, ANN202
         captured["sort"] = sort
-        return real_order(contacts, counts, sort)
+        return real_order(contacts, counts, sort, place_of)
 
     monkeypatch.setattr(widgets, "ordered_contacts", fake_order)
 
@@ -510,7 +510,7 @@ async def test_archive_sweeps_under_a_progress_bar_and_reports_in_a_dialog() -> 
     # The evidence has one lane for each kind. It is never a score, and it is not a
     # percentile now: the row shows what MeshTerm measured, and the order of the list is the
     # ranking.
-    lanes = ["NAME", "HEARD", "PKTS", "MSGS", "HOPS"]
+    lanes = ["NAME", "HEARD", "PKTS", "PLACE"]
     assert [body.index(word) for word in lanes] == sorted(body.index(word) for word in lanes)
     assert all(v.name in body for v in victims)
     preview.handle("enter")
@@ -2100,6 +2100,25 @@ def test_k_on_the_contacts_list_asks_to_toggle_the_lock_of_the_highlighted_conta
     slot = plain.picocalc_lyra_lane[1]
     assert slot is None or slot.opp_label == ""
     assert "^K" not in plain.footer_hint
+
+
+def test_our_row_takes_a_new_name_in_place() -> None:
+    """After our page renamed our node (Device config), our row shows the new name.
+
+    The row stays the same row: the highlight stays where it was.
+    """
+    from meshterm.core.models import Contact
+    from meshterm.ui.contacts_screen import ContactsScreen
+    from tests.conftest import plain
+
+    alice = Contact(name="Alice", public_key="aa" * 32, key_prefix="aa" * 6)
+    screen = ContactsScreen("Us", "cc" * 32, [alice], 1, {}, _contacts_sort())
+    screen.handle("down")
+    highlighted = screen._current_choice().value
+    screen.refresh_self("Renamed", "cc" * 32)
+    body = plain(screen.render_body(72))
+    assert "Renamed" in body and "Us (you)" not in body
+    assert screen._current_choice().value is highlighted
 
 
 async def test_k_on_the_contacts_list_toggles_the_lock_in_place(tmp_path) -> None:  # noqa: ANN001

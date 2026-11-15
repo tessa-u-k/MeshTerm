@@ -1521,3 +1521,184 @@ def test_contact_pages_read_and_write_the_lock_of_a_live_contact(tmp_path) -> No
 
     assert ContactPages(SimpleNamespace(contact_store=store), [alice]).can_lock is False  # type: ignore[arg-type]
     assert ContactPages(None, [alice], self_key=dev).can_lock is False  # type: ignore[arg-type]
+
+
+def test_the_place_row_follows_the_finder_above_where() -> None:
+    """The page reads the place at each paint: it appears when found, above ``where``."""
+    found: list[Text | None] = [None]
+    screen = _screen(
+        info_rows=[("heard", Text("5m ago")), ("where", Text("45.5440, -73.6150"))],
+        place_row=lambda: found[0],
+    )
+    screen.note_viewport(30)
+    assert "place" not in _plain(screen.render_body(72))
+    found[0] = Text("Villeray, Montréal")
+    body = _plain(screen.render_body(72))
+    assert "Villeray, Montréal" in body
+    assert body.index("place") < body.index("where")
+    found[0] = None
+    assert "Villeray" not in _plain(screen.render_body(72))
+
+
+def _own_page_ctx(tmp_path):  # noqa: ANN001, ANN202 - a test AppContext
+    """A context with the simulator as its device, a store on disk, and a full-screen session."""
+    import io
+
+    from rich.console import Console
+
+    from meshterm.context import AppContext
+    from meshterm.core.admin_store import AdminStore
+    from meshterm.core.config import Settings
+    from meshterm.core.device_store import DeviceStore
+    from meshterm.persistence.repository import Repository
+    from meshterm.tools import load_all_tools
+    from meshterm.ui.surface import TuiUi
+    from meshterm.ui.tui.session import TuiSession
+
+    load_all_tools()  # the page reads the menu sections from the registry
+    settings = Settings(config_dir=tmp_path, db_path=tmp_path / "history.db")
+    ctx = AppContext(
+        console=Console(file=io.StringIO()),
+        settings=settings,
+        repo=Repository(settings.db_path),
+        device_store=DeviceStore(tmp_path / "devices.json"),
+        admin_store=AdminStore(tmp_path / "admin.json"),
+        mock=True,
+    )
+    ctx.ui = TuiUi(TuiSession())
+    return ctx
+
+
+async def _next_page(ctx, task, *, after=None):  # noqa: ANN001, ANN202 - a NodeDetailScreen
+    """The node page on top of the session, once it is a page other than ``after``.
+
+    The page of a node with a location reads the map in a thread, so the wait has a time
+    limit and not a count of loop turns. If the task ends first, this helper raises what
+    the task raised, or fails.
+    """
+    import asyncio
+    import time
+
+    from meshterm.ui.node_detail_screen import NodeDetailScreen
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        top = ctx.ui.session.top
+        if isinstance(top, NodeDetailScreen) and top is not after:
+            return top
+        if task.done():
+            task.result()
+            raise AssertionError("the page closed before it showed")
+        await asyncio.sleep(0.001)
+    raise AssertionError("no node page showed")
+
+
+def _action_keys(page) -> list[str]:  # noqa: ANN001 - a NodeDetailScreen
+    """The tokens of the action rows of the Info tab of ``page``."""
+    return [action.key for action in page._info_actions]
+
+
+async def test_our_own_page_opens_and_closes(tmp_path) -> None:  # noqa: ANN001
+    """Enter on our row of the Contacts list opens our page, and Esc closes it.
+
+    The page of our node has no contact. Before, the action rows read a value that only the
+    page of a contact sets, and the page raised ``UnboundLocalError`` before it showed.
+    """
+    import asyncio
+
+    from meshterm.ui.node_detail_screen import open_node_detail
+
+    ctx = _own_page_ctx(tmp_path)
+    task = asyncio.ensure_future(open_node_detail(ctx, None))
+    try:
+        page = await _next_page(ctx, task)
+        assert page.title.endswith("(you)")
+        page.resolve(CANCEL)
+        assert await task is False
+    finally:
+        if not task.done():
+            task.cancel()
+        ctx.repo.close()
+
+
+async def test_our_own_page_offers_the_this_node_section(tmp_path) -> None:  # noqa: ANN001
+    """Our page ends on the rows of the "This node" section of the main menu, in its order.
+
+    The page of a contact does not offer them: these tools act on our node only.
+    """
+    import asyncio
+
+    from meshterm.ui.node_detail_screen import open_node_detail
+
+    ctx = _own_page_ctx(tmp_path)
+    task = asyncio.ensure_future(open_node_detail(ctx, None))
+    try:
+        page = await _next_page(ctx, task)
+        keys = _action_keys(page)
+        assert keys[-3:] == ["tool:info", "tool:config", "tool:advert"]
+        body = _plain(page.render_body(72))
+        for title in ("Device info", "Device config", "Send advert"):
+            assert title in body
+        page.resolve(CANCEL)
+        await task
+
+        contact = next(iter(await ctx.devstate.contacts()))
+        task = asyncio.ensure_future(open_node_detail(ctx, contact))
+        page = await _next_page(ctx, task)
+        assert not [key for key in _action_keys(page) if key.startswith("tool:")]
+        page.resolve(CANCEL)
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+        ctx.repo.close()
+
+
+async def test_a_this_node_row_runs_its_tool_and_a_rename_opens_the_page_again(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    """A row runs its tool as the menu does. After a rename, the page shows the new name.
+
+    A tool that changes nothing that the page shows leaves the same page, with its
+    highlight. A rename (Device config) opens a new page in its place, one level above the
+    same screen.
+    """
+    import asyncio
+
+    from meshterm.ui import menu
+    from meshterm.ui.node_detail_screen import open_node_detail
+
+    ctx = _own_page_ctx(tmp_path)
+    info = dict(await ctx.devstate.self_info())
+    ran: list[str] = []
+
+    async def _run_tool(_ctx, name: str) -> None:  # noqa: ANN001
+        ran.append(name)
+        if name == "config":
+            info["name"] = "Renamed"
+
+    async def _self_info() -> dict:
+        return dict(info)
+
+    monkeypatch.setattr(menu, "run_tool", _run_tool)
+    monkeypatch.setattr(ctx.devstate, "self_info", _self_info)
+    depth = len(ctx.ui.session._stack)
+    task = asyncio.ensure_future(open_node_detail(ctx, None))
+    try:
+        page = await _next_page(ctx, task)
+        page.resolve("tool:info")
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert ran == ["info"] and ctx.ui.session.top is page
+
+        page.resolve("tool:config")
+        renamed = await _next_page(ctx, task, after=page)
+        assert ran == ["info", "config"]
+        assert renamed.title == "Node — Renamed (you)"
+        assert len(ctx.ui.session._stack) == depth + 1
+        renamed.resolve(CANCEL)
+        assert await task is False
+    finally:
+        if not task.done():
+            task.cancel()
+        ctx.repo.close()

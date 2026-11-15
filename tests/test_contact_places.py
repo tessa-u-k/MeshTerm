@@ -1,0 +1,489 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the place of a node on the Contacts list, the CLI, and the map filter.
+
+The place is the named area nearest the location of a node (refer to
+:mod:`meshterm.core.places`). These tests use a small stand-in for the place service, so
+that no database and no network are necessary.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import re
+
+from rich.cells import cell_len
+
+from meshterm.core.models import Contact
+from meshterm.core.places import SOURCE_TILES, Place
+from meshterm.ui.contactlist import PLACE_LANE, ContactListScreen, ContactRow
+from meshterm.ui.contacts_screen import ContactsScreen
+from meshterm.ui.widgets import (
+    CONTACTS_SORT_COLUMNS,
+    CONTACTS_SORT_OPENS_ASCENDING,
+    ContactsSort,
+)
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+_ALICE = "aa" * 32
+_BOB = "bb" * 32
+_CARL = "dd" * 32
+_US = "cc" * 32
+
+
+class _Places:
+    """A stand-in for :class:`~meshterm.services.places.PlaceService`: ``get`` and ``revision``."""
+
+    def __init__(self, found: dict[str, Place]) -> None:
+        self.found = found
+        self.revision = 0
+
+    def get(self, node: str | None) -> Place | None:
+        return self.found.get((node or "")[:12])
+
+
+def _places() -> _Places:
+    return _Places(
+        {
+            _ALICE[:12]: Place("Villeray", "Montréal", SOURCE_TILES),
+            _BOB[:12]: Place("Mont Royal", None, SOURCE_TILES, peak=True),
+        }
+    )
+
+
+def _sort(name: str = "name") -> ContactsSort:
+    return ContactsSort.from_name(name, CONTACTS_SORT_COLUMNS, CONTACTS_SORT_OPENS_ASCENDING)
+
+
+def _screen(places: _Places | None = None, sort: str = "name") -> ContactsScreen:
+    contacts = [
+        Contact(name="Alice", public_key=_ALICE),
+        Contact(name="Bob", public_key=_BOB),
+        Contact(name="Carl", public_key=_CARL),
+    ]
+    return ContactsScreen(
+        "Homestead", _US, contacts, 1, {}, _sort(sort), places=places if places else _places()
+    )
+
+
+def _lines(screen: ContactListScreen, width: int) -> list[str]:
+    return [_ANSI.sub("", line) for line in screen.render_body(width)]
+
+
+def _row(screen: ContactListScreen, width: int, name: str) -> str:
+    return next(line for line in _lines(screen, width) if name in line)
+
+
+def _names(screen: ContactListScreen, width: int = 200) -> list[str]:
+    """The contact names in the order that the list draws them (our node first)."""
+    drawn = _lines(screen, width)
+    order = ["Homestead", "Alice", "Bob", "Carl"]
+    return sorted(order, key=lambda n: next(i for i, line in enumerate(drawn) if n in line))
+
+
+# -- part 1: the PLACE column ---------------------------------------------------------
+
+
+def test_place_column_is_immediately_before_the_key() -> None:
+    """The header reads NAME, HEARD, PKTS, PLACE, KEY in that order."""
+    header = _lines(_screen(), 200)[0]
+    labels = [header.index(label) for label in ("NAME", "HEARD", "PKTS", "PLACE", "KEY")]
+    assert labels == sorted(labels)
+    assert "PLACE" in header and header.rstrip().endswith("KEY")
+
+
+def test_place_shows_the_full_label_and_a_dash_when_unknown() -> None:
+    """A known place is its label. An unknown place is the faint dash of the other lanes."""
+    screen = _screen()
+    alice = _row(screen, 200, "Alice")
+    carl = _row(screen, 200, "Carl")
+    assert "Villeray, Montréal" in alice
+    assert "Mont Royal" in _row(screen, 200, "Bob")
+    # The place is before the key on the row, and a node with no place has the dash there.
+    assert alice.index("Villeray") < alice.index("aaaa")
+    assert carl.index("—", carl.index("Carl") + 4) < carl.index("dddd")
+    assert "Villeray" not in carl
+
+
+def test_place_column_cuts_no_value() -> None:
+    """The label of a row keeps its full place and its full key, however narrow the terminal."""
+    screen = _screen()
+    label = "".join(
+        _ANSI.sub("", str(getattr(c, "label", "")))
+        for c in screen._choices()  # noqa: SLF001
+    )
+    assert "Villeray, Montréal" in label
+    assert _ALICE in label
+    assert _US in label
+
+
+def test_pan_keeps_header_and_rows_aligned() -> None:
+    """After the table pans, the PLACE label is still over the places of the rows."""
+    screen = _screen()
+    width = 53
+    for _ in range(3):
+        lines = _lines(screen, width)
+        header = lines[0]
+        alice = next(line for line in lines if "Alice" in line)
+        if "PLACE" in header and "Villeray" in alice:
+            assert header.index("PLACE") == alice.index("Villeray")
+            break
+        screen.handle("right")
+    else:  # pragma: no cover - the place must come into view
+        raise AssertionError("the PLACE lane never came into view")
+
+
+def test_pan_holds_the_name_still() -> None:
+    """The mark, the glyph, and the name stay while the lanes slide."""
+    screen = _screen()
+    before = _row(screen, 53, "Alice")[:12]
+    screen.handle("right")
+    screen.handle("right")
+    assert _row(screen, 53, "Alice")[:12] == before
+
+
+def test_unselected_rows_are_cut_only_at_the_screen_edge() -> None:
+    """A narrow terminal shows a cut mark at the edge. The row itself is not shortened."""
+    screen = _screen()
+    narrow = _row(screen, 40, "Alice")
+    assert cell_len(narrow) <= 40
+    wide = _row(screen, 200, "Alice")
+    assert "Villeray, Montréal" in wide and _ALICE in wide
+
+
+def test_scroll_atom_is_in_the_hint_only_while_the_row_overflows() -> None:
+    """The footer names ←→ exactly when the highlighted row runs past the edge."""
+    screen = _screen()
+    screen.render_body(40)
+    assert "←→ scroll" in screen.footer_hint
+    screen.render_body(400)
+    assert "←→ scroll" not in screen.footer_hint
+
+
+def test_our_node_shows_its_place() -> None:
+    """The row of our node shows its place when MeshTerm knows it, and a dash if not."""
+    places = _places()
+    assert "—" in _row(_screen(places), 200, "Homestead").split("(you)")[1]
+    places.found[_US[:12]] = Place("Rosemont", "Montréal", SOURCE_TILES)
+    assert "Rosemont, Montréal" in _row(_screen(places), 200, "Homestead")
+
+
+def test_place_is_sortable() -> None:
+    """The sort ring has a place column. Places run A to Z, and a node with none runs last."""
+    screen = _screen(sort="place")
+    assert [PLACE_LANE.column] == [c for c in CONTACTS_SORT_COLUMNS if c == "place"]
+    # Mont Royal (Bob), then Villeray (Alice), then no place (Carl). Our node stays first.
+    assert _names(screen) == ["Homestead", "Bob", "Alice", "Carl"]
+    screen.handle("ctrl_down")
+    assert _names(screen) == ["Homestead", "Carl", "Alice", "Bob"]
+
+
+def test_place_sort_triangle_is_next_to_the_label() -> None:
+    """The triangle comes directly after ``PLACE``, not at the far end of the wide lane.
+
+    The sort must not move a column: ``KEY`` stays above the keys in both states.
+    """
+    from meshterm.ui.contactlist import _GAP, _header
+
+    lanes = (dataclasses.replace(PLACE_LANE, width=30),)
+    for sort in ("place", "name"):
+        header = _header(10, _sort(sort), lanes).plain
+        if sort == "place":
+            assert "PLACE ▲" in header
+        # The pointer and the type glyph (4), the name lane, the place lane, each with its gap.
+        assert header.index("KEY") == 4 + (10 + _GAP) + (30 + _GAP)
+
+
+def test_ctrl_arrows_reach_the_place_column() -> None:
+    """Ctrl+→ goes name, heard, packets, place, hash."""
+    screen = _screen()
+    seen = []
+    for _ in range(4):
+        screen.handle("ctrl_right")
+        seen.append(screen._sort.column)  # noqa: SLF001
+    assert seen == ["heard", "packets", "place", "hash"]
+
+
+def test_a_found_place_draws_without_a_new_screen() -> None:
+    """When the service counts a change, the list reads the places again and keeps the highlight."""
+    places = _places()
+    screen = _screen(places)
+    screen.handle("down")
+    screen.handle("down")
+    current = screen._current_choice().value  # noqa: SLF001
+    assert "Verdun" not in "\n".join(_lines(screen, 200))
+    places.found[_CARL[:12]] = Place("Verdun", "Montréal", SOURCE_TILES)
+    places.revision += 1
+    assert "Verdun, Montréal" in _row(screen, 200, "Carl")
+    assert screen._current_choice().value == current  # noqa: SLF001
+
+
+def test_lists_without_the_lane_are_unchanged() -> None:
+    """A list that does not declare the lane draws no PLACE column."""
+    screen = ContactListScreen(
+        "Pick",
+        rows=[ContactRow(value=1, name="Alice", key=_ALICE, place="Villeray, Montréal")],
+        prefix_bytes=1,
+        sort=ContactsSort.from_name("name"),
+    )
+    assert "PLACE" not in _lines(screen, 100)[0]
+    assert "Villeray" not in _row(screen, 100, "Alice")
+
+
+# -- part 1b: the Archived list ------------------------------------------------------
+
+
+def _archived(places: _Places | None = None, sort: str = "name") -> ContactListScreen:
+    """The Archived list over Alice, Bob, and Carl, with the place service of the test."""
+    from meshterm.core.contact_store import RememberedContact
+    from meshterm.ui.archived_screen import ArchivedScreen, archived_rows
+    from meshterm.ui.contactlist import ARCHIVED_SORT_COLUMNS, ARCHIVED_SORT_OPENS_ASCENDING
+
+    remembered = [
+        RememberedContact(public_key=_ALICE, name="Alice", archived_at=1_700_000_000),
+        RememberedContact(public_key=_BOB, name="Bob", archived_at=1_700_000_000),
+        RememberedContact(public_key=_CARL, name="Carl", archived_at=1_700_000_000),
+    ]
+    order = ContactsSort.from_name(sort, ARCHIVED_SORT_COLUMNS, ARCHIVED_SORT_OPENS_ASCENDING)
+    return ArchivedScreen(archived_rows(remembered), 1, order, places or _places())
+
+
+def _archived_names(screen: ContactListScreen) -> list[str]:
+    """The names in the order that the Archived list draws them."""
+    drawn = _lines(screen, 200)
+    order = ["Alice", "Bob", "Carl"]
+    return sorted(order, key=lambda n: next(i for i, line in enumerate(drawn) if n in line))
+
+
+def test_archived_list_has_the_place_column_before_the_key() -> None:
+    """The Archived list reads NAME, PLACE, ARCHIVED, KEY, and shows each full label."""
+    screen = _archived()
+    header = next(line for line in _lines(screen, 200) if "NAME" in line)
+    labels = [header.index(label) for label in ("NAME", "PLACE", "ARCHIVED", "KEY")]
+    assert labels == sorted(labels)
+    alice = _row(screen, 200, "Alice")
+    assert "Villeray, Montréal" in alice
+    assert alice.index("Villeray") < alice.index("aaaa")
+
+
+def test_archived_list_sorts_by_place() -> None:
+    """Ctrl+← reaches the place column. Places run A to Z, and a node with none runs last."""
+    screen = _archived(sort="archived")
+    screen.handle("ctrl_left")
+    assert screen._sort.column == "place"  # noqa: SLF001
+    assert _archived_names(screen) == ["Bob", "Alice", "Carl"]
+    screen.handle("ctrl_down")
+    assert _archived_names(screen) == ["Carl", "Alice", "Bob"]
+
+
+def test_archived_list_fills_a_found_place_and_filters_by_place() -> None:
+    """A place that arrives while the list is open draws, and the filter matches it."""
+    places = _places()
+    screen = _archived(places)
+    places.found[_CARL[:12]] = Place("Verdun", "Montréal", SOURCE_TILES)
+    places.revision += 1
+    assert "Verdun, Montréal" in _row(screen, 200, "Carl")
+    _type(screen, "verdun")
+    shown = "\n".join(_lines(screen, 200))
+    assert "Carl" in shown
+    assert "Alice" not in shown and "Bob" not in shown
+
+
+def test_archived_list_cuts_no_value() -> None:
+    """The Archived list pans as the Contacts list does, so a narrow terminal cuts no key."""
+    screen = _archived()
+    assert all(choice.pans for choice in screen._choices())  # noqa: SLF001
+
+
+def test_sweep_preview_has_a_place_lane_and_no_msgs_or_hops(monkeypatch) -> None:  # noqa: ANN001
+    """The preview of a sweep reads NAME, HEARD, PKTS, PLACE, with each place in full."""
+    from meshterm.core.contact_score import ContactSignals, ScoredContact
+    from meshterm.ui import sweep_screen
+
+    monkeypatch.setattr(sweep_screen, "places_of_session", _places)
+
+    def scored(name: str, key: str) -> ScoredContact:
+        contact = Contact(name=name, public_key=key, key_prefix=key[:12])
+        signals = ContactSignals(node=key[:12], packets=3, dm_total=4, hops=2.0)
+        return ScoredContact(contact=contact, signals=signals, score=1.0, percentile=1)
+
+    victims = [scored("Alice", _ALICE), scored("Carl", _CARL)]
+    widths = sweep_screen._lane_widths(victims)  # noqa: SLF001
+    header = sweep_screen._preview_header(widths, 200).split()  # noqa: SLF001
+    assert header == ["NAME", "HEARD", "PKTS", "PLACE"]
+    alice, carl = (sweep_screen._victim_row(v, widths).plain for v in victims)  # noqa: SLF001
+    assert alice.rstrip().endswith("Villeray, Montréal")
+    # The place is on the left of its lane: the dash of Carl starts where the place of Alice
+    # starts.
+    assert carl.index("—") == alice.index("Villeray")
+
+
+# -- part 2: the filter ---------------------------------------------------------------
+
+
+def _type(screen: ContactListScreen, text: str) -> None:
+    for char in text:
+        screen.handle("text", char)
+
+
+def test_filter_matches_the_place() -> None:
+    """Typed text narrows the list by the place of a node, in any case."""
+    screen = _screen()
+    _type(screen, "villeray")
+    shown = "\n".join(_lines(screen, 200))
+    assert "Alice" in shown
+    assert "Bob" not in shown and "Carl" not in shown
+
+
+def test_filter_matches_the_coarse_part_of_the_place() -> None:
+    """The city part of a place matches too, and a name still matches as before."""
+    screen = _screen()
+    _type(screen, "montr")
+    shown = "\n".join(_lines(screen, 200))
+    assert "Alice" in shown and "Bob" not in shown
+    screen.handle("escape")
+    _type(screen, "bob")
+    shown = "\n".join(_lines(screen, 200))
+    assert "Bob" in shown and "Alice" not in shown
+
+
+# -- part 3: the CLI and the machine object -------------------------------------------
+
+
+def _cli_contacts(get):  # noqa: ANN001, ANN202 - a lookup by key, or None
+    from meshterm.tools.contacts import _listing, _place_lookup
+
+    contacts = [
+        Contact(name="Alice", public_key=_ALICE, key_prefix=_ALICE[:12]),
+        Contact(name="Carl", public_key=_CARL, key_prefix=_CARL[:12]),
+    ]
+    return _listing(contacts, {}, 1, _place_lookup(get) if get else None)
+
+
+def _cli_order(sort: str, ascending: bool | None = None) -> list[str]:
+    """The names in the order that the CLI lists them for ``sort``."""
+    from meshterm.tools.contacts import _place_label, _place_lookup
+    from meshterm.ui.widgets import ordered_contacts
+
+    contacts = [
+        Contact(name="Alice", public_key=_ALICE, key_prefix=_ALICE[:12]),
+        Contact(name="Bob", public_key=_BOB, key_prefix=_BOB[:12]),
+        Contact(name="Carl", public_key=_CARL, key_prefix=_CARL[:12]),
+    ]
+    order = _sort(sort)
+    if ascending is not None:
+        order.ascending = ascending
+    place_of = _place_lookup(_places().get)
+    ordered = ordered_contacts(contacts, {}, order, lambda c: _place_label(place_of(c)))
+    return [c.name for c in ordered]
+
+
+def test_cli_sorts_by_place() -> None:
+    """``--sort place`` runs A to Z on the label, and a contact with no place runs last."""
+    assert _cli_order("place") == ["Bob", "Alice", "Carl"]
+    # Descending turns the order over, and the contact with no place comes first.
+    assert _cli_order("place", ascending=False) == ["Carl", "Alice", "Bob"]
+
+
+def test_cli_sorts_by_hash() -> None:
+    """``--sort hash`` runs on the key, from ``0`` to ``f``."""
+    assert _cli_order("hash") == ["Alice", "Bob", "Carl"]
+    assert _cli_order("hash", ascending=False) == ["Carl", "Bob", "Alice"]
+
+
+def _render(face, listing):  # noqa: ANN001, ANN202 - the renderer class
+    import io
+
+    from meshterm.ui import script
+
+    buffer = io.StringIO()
+    face(script.console(buffer)).render((listing,))
+    return buffer.getvalue()
+
+
+def test_node_object_has_a_place_key_that_is_null_when_unknown() -> None:
+    """The machine object of a node has six keys. ``place`` is the label, or ``null``."""
+    import json
+
+    from meshterm.ui.renderers import JsonRenderer
+
+    docs = json.loads(_render(JsonRenderer, _cli_contacts(_places().get)))
+    alice, carl = (d["node"] for d in docs)
+    assert list(alice) == ["name", "key", "hash", "type", "place", "self"]
+    assert alice["place"] == "Villeray, Montréal"
+    assert carl["place"] is None
+
+
+def test_contacts_without_a_lookup_gives_null_places() -> None:
+    """A listing built with no place lookup still has the key, with ``null``."""
+    import json
+
+    from meshterm.ui.renderers import JsonRenderer
+
+    docs = json.loads(_render(JsonRenderer, _cli_contacts(None)))
+    assert [d["node"]["place"] for d in docs] == [None, None]
+
+
+def test_plain_face_has_a_place_column_before_key() -> None:
+    """The PLACE column sits just before KEY, shows the label, and uses ``-`` when unknown."""
+    from meshterm.ui.renderers import PlainRenderer
+
+    header, alice, carl = _render(PlainRenderer, _cli_contacts(_places().get)).splitlines()
+    labels = header.split()
+    assert labels.index("PLACE") == labels.index("KEY") - 1
+    assert "Villeray, Montréal" in alice
+    assert alice.index("Villeray") < alice.index(_ALICE)
+    assert carl.split()[-2] == "-" and carl.split()[-1] == _CARL
+
+
+# -- part 4: the map filter -----------------------------------------------------------
+
+
+def test_marker_matches_its_label_or_its_place() -> None:
+    """The find filter of the map matches the label or the place, in any case."""
+    from meshterm.core.models import MapMarker
+
+    marker = MapMarker("Alice", 45.5, -73.6, place="Villeray, Montréal")
+    assert marker.matches("")
+    assert marker.matches("ali")
+    assert marker.matches("villeray")
+    assert marker.matches("montréal")
+    assert not marker.matches("verdun")
+    assert not MapMarker("Alice", 45.5, -73.6).matches("villeray")
+
+
+def test_with_places_stamps_a_copy_of_each_marker() -> None:
+    """``with_places`` reads the place of each key, and does not change the given markers."""
+    from meshterm.core.models import MapMarker
+    from meshterm.ui.map_screen import with_places
+
+    original = [
+        MapMarker("Alice", 45.5, -73.6, key=_ALICE),
+        MapMarker("Carl", 45.6, -73.7, key=_CARL),
+        MapMarker("Nokey", 45.7, -73.8),
+    ]
+    stamped = with_places(original, _places().get)
+    assert [m.place for m in stamped] == ["Villeray, Montréal", "", ""]
+    assert [m.place for m in original] == ["", "", ""]
+    assert [m.label for m in stamped] == ["Alice", "Carl", "Nokey"]
+
+
+def test_map_find_matches_a_place() -> None:
+    """Typed text narrows the map to the nodes whose place matches it."""
+    from meshterm.core.models import MapMarker
+    from meshterm.ui.map_screen import MapScreen, with_places
+    from tests.test_map import _StubSession, _StubSource
+
+    markers = with_places(
+        [
+            MapMarker("Alice", 45.5, -73.6, key=_ALICE),
+            MapMarker("Bob", 45.6, -73.7, key=_BOB),
+            MapMarker("Carl", 45.7, -73.8, key=_CARL),
+        ],
+        _places().get,
+    )
+    screen = MapScreen(_StubSession(80, 24), markers, _StubSource(), 14)
+    screen.render_body(80)  # the first paint makes the viewport that a key needs
+    for char in "villeray":
+        screen.handle("text", char)
+    assert [m.label for m in screen._matches()] == ["Alice"]  # noqa: SLF001

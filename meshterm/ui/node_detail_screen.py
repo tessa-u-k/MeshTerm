@@ -101,8 +101,9 @@ import asyncio
 import math
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -111,11 +112,17 @@ from rich.text import Text
 
 from ..core.connection import ContactNotOnDeviceError, DeviceCommandError
 from ..core.geo import haversine_km, usable_fix
-from ..core.models import NODE_TYPE_LABELS, NODE_TYPE_REPEATER, Contact, utcnow
+from ..core.models import NODE_TYPE_LABELS, NODE_TYPE_REPEATER, NODE_TYPE_ROOM, Contact, utcnow
+from ..core.places import SOURCE_USER
 from ..platforms import Platform, on_platform
+from ..services.clock_offsets import node_offset, room_posts_blocked
 from . import menus
+from .device_route_screen import ACTION as DEVICE_ROUTE_ACTION
+from .device_route_screen import ICON as DEVICE_ROUTE_ICON
+from .device_route_screen import RouteEnv, open_device_route
+from .device_route_screen import row_label as device_route_label
 from .mapcanvas import RGB
-from .marks import SELF_MARK
+from .marks import MANAGED_ICON, SELF_MARK
 from .minimap import MiniMap
 from .pathgraph import (
     DST_NODE,
@@ -138,6 +145,9 @@ from .pathline import (
     hops_atom,
     with_action_mark,
 )
+from .placemode import ACTION as PLACES_ACTION
+from .placemode import NodeOf, PlaceToggle, node_of, placed, places_of_session
+from .theme import glyph as platform_glyph
 from .theme import mark_rgb, name_style, snr_style
 from .tui.render import crop_cells, render_hanging, render_lines, render_to_ansi
 from .tui.screen import CANCEL, ListWindow, Screen
@@ -147,6 +157,7 @@ from .widgets import (
     _recency_style,
     age_seconds,
     format_ago,
+    format_offset,
     highlighted_hash,
     node_type_legend,
     short_frame,
@@ -323,12 +334,15 @@ class _Route:
         context: The line that hangs under ``path``: the hop count, then the bottleneck
             SNR, the sample count, and a ``★ best`` or ``device route`` tag when the route
             has them. The hop count is always there, so this line is never empty.
+        line: The same path line before it became text. With it, place mode (^N) can name
+            the hops by their places. ``None`` means that the route has no place mode.
     """
 
     draw: tuple[str, ...]
     spec: str
     path: Text
     context: Text
+    line: PathLine | None = None
 
 
 @dataclass(slots=True)
@@ -377,6 +391,8 @@ class _RoutesView:
         legend: Whether to draw the node-type legend below the graph (a relay with a known
             type was shown).
         note: The muted line shown instead of a graph when there is no evidence.
+        find: Gives the node id for the hash of a hop (:func:`~meshterm.ui.placemode.node_of`
+            of the resolver), for place mode. ``None`` when the resolver cannot tell.
     """
 
     routes: list[_Route] = field(default_factory=list)
@@ -385,6 +401,7 @@ class _RoutesView:
     label_rgb_of: LabelRgbOf | None = None
     legend: bool = False
     note: str = ""
+    find: NodeOf | None = None
 
 
 @dataclass(slots=True)
@@ -441,10 +458,15 @@ class NodeDetailScreen(Screen):
 
         The pager works only when the route list is really in a list window. On the Info tab,
         and on a node whose routes all fit, the keys move nothing.
+
+        F1 is the place mode of the path lines (^N). It has a chip only while the Routes tab
+        shows a path line that place mode can change.
         """
         from .tui.fkeys import FPair, default_lane
 
         lane = list(default_lane(nav=self._list_hidden))
+        if self._places_available():
+            lane[0] = FPair(self._places.chip, PLACES_ACTION)
         if len(self._tabs) >= 2:
             nxt = self._tabs[(self._tab_index + 1) % len(self._tabs)]
             lane[2] = FPair(nxt.name, "tab")
@@ -485,7 +507,9 @@ class NodeDetailScreen(Screen):
         routes: _RoutesView | None = None,
         info_actions: list[_Action] | None = None,
         trace_action: _Action | None = None,
+        route_action: _Action | None = None,
         mark: Text | None = None,
+        place_row: Callable[[], Text | None] | None = None,
     ) -> None:
         """Build the page for display data that is already resolved.
 
@@ -515,6 +539,12 @@ class NodeDetailScreen(Screen):
             trace_action: The ``Trace — auto route …`` action of the Routes tab, or
                 ``None``. It is shown only when there are no routes to list. When routes
                 are listed, Enter on a route row starts the trace.
+            route_action: The ``Device route · …`` row of the Routes tab, after the routes,
+                or ``None`` when the radio has no contact for the node (refer to
+                :mod:`meshterm.ui.device_route_screen`).
+            place_row: Gives the value of the ``place`` vital, or ``None`` when there is no
+                place. The page asks at each paint, because the place finder can answer
+                after the page opened (refer to :mod:`meshterm.services.places`).
         """
         super().__init__()
         self.title = title
@@ -524,12 +554,14 @@ class NodeDetailScreen(Screen):
         self._compact = False
         self._header = header
         self._info_rows = info_rows
+        self._place_row = place_row
         self._tabs = tabs
         self._minimap = minimap
         self._map_caption = map_caption
         self._routes = routes
         self._info_actions = info_actions or []
         self._trace_action = trace_action
+        self._route_action = route_action
         #: The width in cells of the icon lane of the action rows. It is measured one time
         #: over each mark that this page can draw. Thus a one-cell ``🗑`` gets padding to the
         #: width of its two-cell siblings, and each label starts in the same cell. It is zero
@@ -563,6 +595,8 @@ class NodeDetailScreen(Screen):
         #: The last render width. With it, the footer hint can tell whether the path line of
         #: the highlighted route really overflows (nothing overflows before the first paint).
         self._last_width = 0
+        #: ^N: the path lines of the Routes tab show the node names, or the places.
+        self._places = PlaceToggle()
 
     # --- input -----------------------------------------------------------------
 
@@ -590,8 +624,23 @@ class NodeDetailScreen(Screen):
             parts.append("←→ scroll")
         elif self._key_overflows():
             parts.append("←→ scroll key")
+        if self._places_available():
+            parts.append(self._places.hint)
         parts.append("Esc back")
         return " · ".join(parts)
+
+    def _places_available(self) -> bool:
+        """Whether ^N acts: the Routes tab is open and a route has a path line to change."""
+        tab = self._tabs[self._tab_index] if self._tabs else None
+        if tab is None or tab.kind != "routes" or self._routes is None:
+            return False
+        return any(route.line is not None for route in self._routes.routes)
+
+    def _route_path(self, route: _Route) -> Text:
+        """The path line of a route as text: with its places while place mode is on."""
+        if self._places.on and route.line is not None and self._routes is not None:
+            return placed(route.line, places_of_session(), self._routes.find).text()
+        return route.path
 
     def _selected_route_overflows(self) -> bool:
         """Whether the highlighted path line is too wide for the content lane of the list.
@@ -613,7 +662,7 @@ class NodeDetailScreen(Screen):
         # The `…` at the end is chrome outside the lane (pathline.with_action_mark), so it
         # is not part of what must fit. A route exactly as wide as its lane does not scroll,
         # and the mark is the thing that is not shown.
-        return cell_len(routes[self._row_index].path.plain) > avail
+        return cell_len(self._route_path(routes[self._row_index]).plain) > avail
 
     def _on_info_tab(self) -> bool:
         """Whether the Info tab fills the stage (thus its key lane is visible)."""
@@ -668,7 +717,8 @@ class NodeDetailScreen(Screen):
     def _measure_icon_lane(self) -> int:
         """The icon lane of the action rows, measured over each mark that is now on the page."""
         trace = [self._trace_action] if self._trace_action else []
-        return menus.icon_lane(action.glyph for action in (*self._info_actions, *trace))
+        route = [self._route_action] if self._route_action else []
+        return menus.icon_lane(action.glyph for action in (*self._info_actions, *trace, *route))
 
     def replace_info_row(self, label: str, value: Text) -> None:
         """Replace the value of one vital in place: the regions row, after the repeater answered.
@@ -682,6 +732,22 @@ class NodeDetailScreen(Screen):
                 self._info_rows[i] = (label, value)
                 return
         self._info_rows.append((label, value))
+
+    def _sync_place(self) -> None:
+        """Put the current place into the vitals: above ``where``, or gone when unknown."""
+        if self._place_row is None:
+            return
+        value = self._place_row()
+        labels = [label for label, _value in self._info_rows]
+        if "place" in labels:
+            index = labels.index("place")
+            if value is None:
+                del self._info_rows[index]
+            else:
+                self._info_rows[index] = ("place", value)
+        elif value is not None:
+            index = labels.index("where") if "where" in labels else len(labels)
+            self._info_rows.insert(index, ("place", value))
 
     def replace_info_actions(self, actions: list[_Action]) -> None:
         """Replace the action rows of the Info tab in place, with the highlight on the same row.
@@ -704,6 +770,33 @@ class NodeDetailScreen(Screen):
                 self._row_index = index
                 break
 
+    def replace_routes(
+        self,
+        routes: _RoutesView | None,
+        *,
+        route_action: _Action | None,
+        trace_action: _Action | None,
+    ) -> None:
+        """Replace the Routes tab in place, after the device route changed.
+
+        The routes are data (the device route tags one of them, and it leads the
+        suggestions), so the list refreshes and the page stays. The highlight stays on the
+        ``Device route`` row, because the user comes back to the row that opened the popup.
+        """
+        self._routes = routes
+        self._route_action = route_action
+        self._trace_action = trace_action
+        self._stage_memo = None
+        self._route_sel = 0
+        self._icon_lane = self._measure_icon_lane()
+        focus = self._focusables()
+        for index, (_kind, payload) in enumerate(focus):
+            if payload is route_action and route_action is not None:
+                self._row_index = index
+                break
+        else:
+            self._row_index = min(self._row_index, max(0, len(focus) - 1))
+
     def handle(self, action: str, data: str = "") -> None:
         """Answer one key press on the page.
 
@@ -725,6 +818,9 @@ class NodeDetailScreen(Screen):
                 else:
                     assert isinstance(payload, _Action)
                     self.resolve(payload.key)
+        elif action == PLACES_ACTION:
+            if self._places_available():
+                self._places.flip()
         elif action == "tab":
             self._switch_tab(1)
         elif action == "shift_tab":
@@ -820,6 +916,8 @@ class NodeDetailScreen(Screen):
             focus.extend(("path", i) for i in range(len(self._routes.routes)))
             if not self._routes.routes and self._trace_action is not None:
                 focus.append(("action", self._trace_action))
+            if self._route_action is not None:
+                focus.append(("action", self._route_action))
         elif tab is not None and tab.kind == "info":
             focus.extend(("action", a) for a in self._info_actions)
         return focus
@@ -840,6 +938,7 @@ class NodeDetailScreen(Screen):
         """
         viewport = self._scroll_viewport
         self._last_width = width
+        self._sync_place()
         focus = self._focusables()
         if focus:
             self._row_index %= len(focus)
@@ -1131,7 +1230,7 @@ class NodeDetailScreen(Screen):
         indent = _ROUTE_INDENT
         avail = max(1, width - indent)
         pointer = Text("❯ " if selected else "  ", style="cursor" if selected else "")
-        marked = route.path
+        marked = self._route_path(route)
         if selected and self._hshift:
             total = cell_len(marked.plain)
             # A scrolled row gave one cell to its left mark, so its last visible part has
@@ -1209,6 +1308,32 @@ def _bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> str:
     x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
     deg = (math.degrees(math.atan2(y, x)) + 360) % 360
     return _COMPASS[round(deg / 45) % 8]
+
+
+def _place_text(label: str, *, typed: bool) -> Text:
+    """The value of the ``place`` vital: the place, and ``· typed`` for a place the user typed."""
+    text = Text(label)
+    if typed:
+        text.append("  ·  typed", style="muted")
+    return text
+
+
+async def _set_place(ctx: AppContext, node_id: str, label: str) -> None:
+    """Ask for the place of a node, and keep it. A blank answer clears the typed place.
+
+    The prompt offers the typed place as its default, so a small change does not need the
+    full text again. Esc keeps the place as it was.
+    """
+    places = ctx.places
+    typed = await ctx.ui.session.text(
+        f"Place — {label}",
+        prompt="Place of the node (blank to use the found place):",
+        default=places.typed(node_id) or "",
+        floating=True,
+    )
+    if typed is None:
+        return
+    places.set_typed(node_id, typed)
 
 
 def _range_text(lat: float, lon: float, self_lat: float | None, self_lon: float | None) -> Text:
@@ -1397,7 +1522,10 @@ async def open_node_detail(
         ctx: The shared application context (the interactive TUI must be running).
         contact: The contact to show, or ``None`` for our node (a page of identity and
             ledger only, because our node never overhears itself, so there is no reception
-            history to show).
+            history to show). The page of our node also offers the tools of the ``This
+            node`` section of the main menu. If one of them changes what the page shows
+            (Device config can change the name or the location), the page opens again with
+            the new values.
         manage: Whether to show the contact-management actions (lock, archive, restore,
             delete). ``False`` draws none of them, and then the page can only return
             ``False``.
@@ -1435,10 +1563,7 @@ async def open_node_detail(
 
     # -- our node, for the "us" label, the centre of the location preview, and the range
     # and bearing.
-    try:
-        info = await ctx.devstate.self_info()
-    except Exception:  # noqa: BLE001 - the page is useful without our identity and fix
-        info = {}
+    info = await _read_self_info(ctx)
     self_name = str(info.get("name") or "this node")
     self_key = str(info.get("public_key") or "")
     self_lat, self_lon = _as_float(info.get("adv_lat")), _as_float(info.get("adv_lon"))
@@ -1510,6 +1635,13 @@ async def open_node_detail(
         header.append("   your node", style="muted")
     elif type_label:
         header.append(f"   {type_label}", style="muted")
+    # A managed node: MeshTerm stores its admin password. The key says so next to the type,
+    # the same mark as in the Contacts list.
+    admin_store = getattr(ctx, "admin_store", None)
+    managed = not you and contact is not None and admin_store is not None
+    managed = managed and admin_store.get(contact) is not None
+    if managed:
+        header.append(f"   {platform_glyph(MANAGED_ICON)} managed", style="muted")
 
     # -- the observed topology: the suggested best path, and the routes to draw.
     target_hash = key.lower().removeprefix("0x")
@@ -1525,14 +1657,43 @@ async def open_node_detail(
     if not you and contact is not None and contact.route_hops is not None:
         device_route = tuple(topo.canonical(h) or h for h in contact.route_hops)
     canonical_target = (topo.canonical(target_hash) or target_hash[:12]) if target_hash else None
-    suggested = topo.suggested(canonical_target) if canonical_target else None
+    # The outbound paths of the user lead the suggestions, as on the trace screen (refer to
+    # MeshTopology.scenarios). A stub context of a test has no store, and gets none.
+    outbound_store = getattr(ctx, "outbound_store", None)
+    choice = outbound_store.lookup(self_key or None) if outbound_store is not None else None
+    outbound = (
+        tuple(tuple(topo.canonical(h) or h for h in path) for path in choice.paths)
+        if choice is not None
+        else ()
+    )
+    prefs = getattr(ctx, "preferences", None)
+    silent_before = (
+        utcnow() - timedelta(hours=prefs.outbound_silent_hours) if prefs is not None else None
+    )
+    suggested = (
+        topo.suggested(canonical_target, outbound=outbound, silent_before=silent_before)
+        if canonical_target
+        else None
+    )
     scenarios = (
-        topo.scenarios(canonical_target, device_route=device_route) if canonical_target else []
+        topo.scenarios(
+            canonical_target,
+            device_route=device_route,
+            outbound=outbound,
+            silent_before=silent_before,
+        )
+        if canonical_target
+        else []
     )
 
     # -- the info block (the identity, how the node was heard, and where it is). The routes
     # go into the Routes tab.
     info_rows: list[tuple[str, Text]] = []
+    # Whether a room sends us no new post, because its clock went back (set below).
+    room_blocked = False
+    # The date until which the device refuses the adverts of the node (set below). Our own
+    # page has none, but the action rows read it on each page.
+    refused: datetime | None = None
     if key:
         info_rows.append(("key", highlighted_hash(key, prefix_bytes, known=bool(name))))
     else:
@@ -1555,6 +1716,41 @@ async def open_node_detail(
         signal = _signal_row(hn)
         if signal is not None:
             info_rows.append(("signal", signal))
+        clock_offset = _clock_offset(
+            ctx,
+            node_id,
+            name,
+            make_name_key_resolver(contacts, stored_names, heard=named_at),
+        )
+        if clock_offset is not None:
+            info_rows.append(
+                ("clock", _clock_text(clock_offset, ctx.preferences.clock_tolerance_s))
+            )
+        refused = contact.adverts_refused_until if contact is not None else None
+        if refused is not None:
+            # The device drops each advert of the node until this date (refer to
+            # ``Contact.adverts_refused_until``). The row says why the node looks silent.
+            info_rows.append(("adverts", _refused_text(refused)))
+        # A room whose clock went back past its newest post sends us no new post (refer to
+        # ``room_posts_blocked``). The row says why the board looks quiet.
+        if node_type == NODE_TYPE_ROOM and node_id:
+            newest_post = ctx.repo.newest_room_post(node_id)
+            if room_posts_blocked(newest_post, clock_offset, ctx.preferences.clock_tolerance_s):
+                room_blocked = True
+                info_rows.append(("posts", _blocked_text(newest_post)))
+    # The place: read at each paint (refer to ``NodeDetailScreen._sync_place``), because the
+    # place finder can answer after the page opened. The page puts the node first in its
+    # queue, because the user looks at it now.
+    places = getattr(ctx, "places", None)
+    if places is not None and node_id and lat is not None and lon is not None:
+        places.want_at(node_id, lat, lon)
+
+    def place_row() -> Text | None:
+        place = places.get(node_id) if places is not None and node_id else None
+        if place is None:
+            return None
+        return _place_text(place.label, typed=place.source == SOURCE_USER)
+
     if lat is not None and lon is not None:
         info_rows.append(("where", _range_text(lat, lon, self_lat, self_lon)))
     # The regions of a repeater: what it was last heard to relay, from the region store (its
@@ -1640,10 +1836,32 @@ async def open_node_detail(
     full_key = key.lower().removeprefix("0x")
     if len(full_key) == 64 and is_path_hash(full_key):
         info_actions.append(_Action("share", "📱", "", "Share contact — QR / link"))
+    # The user can type a place for each node: a place that the user knows better than the
+    # map (a roof, a tower), or a place for a node with no location at all.
+    if places is not None and node_id:
+        info_actions.append(_Action("place", "✎", "", "Set place…"))
+    if you:
+        # Our page is where the user looks at our node, so it offers the tools of the main
+        # menu that act on our node: its whole ``This node`` section, row for row.
+        info_actions.extend(_this_node_actions())
     if asks_regions:
         # It acts immediately (one anonymous request, one transmission), so no "…" at the
         # end.
         info_actions.append(_Action("regions", "🔖", "", "Ask which regions it carries"))
+    # A managed repeater or room server can have its clock set from here: its password is
+    # stored, so the login asks nothing. The action is offered whatever the offset, because
+    # an unknown offset is a reason to set the clock too.
+    if managed and node_type in (NODE_TYPE_REPEATER, NODE_TYPE_ROOM):
+        info_actions.append(_Action("clock", "🕒", "", "Sync its clock…"))
+    # The device refuses each advert of this node until a date in the future. The repair
+    # writes the record back with that date lowered (refer to
+    # ``Device.accept_adverts_again``). It writes to the device, so it confirms first.
+    if refused is not None and not you and contact is not None and contact.public_key:
+        info_actions.append(_Action("adverts", "📡", "warn", "Accept its adverts again…"))
+    # The room sends no new post (refer to ``room_blocked``). The repair adds the contact back
+    # with a sync time of zero, then logs in again (refer to ``Device.reset_room_sync``).
+    if room_blocked and contact is not None and contact.public_key:
+        info_actions.append(_Action("resync", "📌", "warn", "Ask for all its posts again…"))
     # -- contact management: the last group of the page, and the only actions that end the
     # visit. None of them shows when the caller opened the page to look, not to act (refer
     # to ``manage``), except the lock when the caller lets the page lock (refer to
@@ -1684,10 +1902,90 @@ async def open_node_detail(
     trace_action: _Action | None = None
     if not you and node_id and not (routes_view is not None and routes_view.routes):
         trace_action = _Action("trace", "🎯", "", "Trace — auto route …")
+    # -- the device route: the route that the radio holds for this contact, after the routes
+    # (refer to meshterm.ui.device_route_screen). Only a contact that the radio has gets it,
+    # because the radio holds a route only for its own contacts.
+    route_env: RouteEnv | None = None
+    route_action: _Action | None = None
+    if (
+        routes_view is not None
+        and contact is not None
+        and whole_key
+        and canonical_target is not None
+        and getattr(ctx, "routes", None) is not None
+        and not _is_archived(ctx, contact, self_key)
+    ):
+        route_env = RouteEnv(
+            contact=contact,
+            label=label,
+            target=canonical_target,
+            topology=topo,
+            self_key=dev_pub,
+            width_bytes=width_bytes,
+            resolve=resolve,
+            scenarios=list(scenarios),
+            suggested=suggested,
+            outbound=outbound,
+        )
+
+    def device_route_row(current: Contact) -> _Action:
+        """The row of the device route, for what the radio holds now."""
+        status = ctx.routes.status(
+            current, device_key=dev_pub, topo=topo, silent_before=silent_before
+        )
+        return _Action(DEVICE_ROUTE_ACTION, DEVICE_ROUTE_ICON, "", device_route_label(status))
+
+    if route_env is not None:
+        route_action = device_route_row(route_env.contact)
+
+    async def refresh_device_route() -> None:
+        """Read the contact again after a change, and draw the Routes tab again in place."""
+        assert route_env is not None
+        try:
+            fresh = await ctx.devstate.contacts()
+        except Exception:  # noqa: BLE001 - keep the old snapshot, the row still opens
+            fresh = []
+        wanted = route_env.contact.public_key.lower()
+        current = next((c for c in fresh if c.public_key.lower() == wanted), route_env.contact)
+        route_env.contact = current
+        new_route = (
+            tuple(topo.canonical(h) or h for h in current.route_hops)
+            if current.route_hops is not None
+            else None
+        )
+        route_env.scenarios = topo.scenarios(
+            route_env.target,
+            device_route=new_route,
+            outbound=outbound,
+            silent_before=silent_before,
+        )
+        view = _routes_view(
+            topo,
+            route_env.scenarios,
+            suggested,
+            new_route,
+            canonical_target,
+            target_hash,
+            width_bytes,
+            resolve=resolve,
+            type_of=make_node_type_resolver(contacts),
+            key_of=make_name_key_resolver(contacts, stored_names, heard=named_at),
+            style=route_graph_style,
+            self_name=self_name,
+            node_label=label,
+            name_key=key,
+            node_known=name is not None,
+            hash_bytes=prefix_bytes,
+        )
+        trace = None if view.routes else _Action("trace", "🎯", "", "Trace — auto route …")
+        screen.replace_routes(view, route_action=device_route_row(current), trace_action=trace)
+
     title = f"Node — {label}" if not you else f"Node — {label} (you)"
     # Whether the visit ended with a delete of the contact. This tells the caller to build
     # its list again.
     contact_removed = False
+    # Whether a tool changed what the page shows of our node. Then the page opens again.
+    reopen = False
     # One screen for the full visit. The page is a *hub*: each action on it opens a different
     # screen and comes back. Thus the page stays pushed while each action runs
     # (``session.stay``), and it is not built again for each round. Before, each new build
@@ -1706,7 +2004,9 @@ async def open_node_detail(
         routes=routes_view,
         info_actions=info_actions,
         trace_action=trace_action,
+        route_action=route_action,
         mark=mark,
+        place_row=place_row,
     )
     async with session.stay(screen) as visit:
         while True:
@@ -1715,6 +2015,10 @@ async def open_node_detail(
                 break
             if action == "trace":
                 await open_trace(ctx, name or key, initial_spec=screen.selected_spec())
+            elif action == DEVICE_ROUTE_ACTION:
+                assert route_env is not None  # offered only then
+                if await open_device_route(ctx, route_env):
+                    await refresh_device_route()
             elif action == "map":
                 if markers:
                     # Open the map centred on this node (the same place that the inline
@@ -1734,6 +2038,9 @@ async def open_node_detail(
                     )
             elif action == "share":
                 await show_contact_card(ctx, label, full_key, adv_type)
+            elif action == "place":
+                assert places is not None  # offered only then
+                await _set_place(ctx, node_id, label)
             elif action == "regions":
                 assert contact is not None and region_store is not None  # offered only then
                 failed = await _ask_regions(ctx, contact, node_id, label, routed=routed)
@@ -1746,6 +2053,27 @@ async def open_node_detail(
                     await open_timemachine_self(ctx)
                 else:
                     await open_timemachine_node(ctx, node_id, label)
+            elif action == "clock":
+                from .repeater_admin import sync_clock
+
+                assert contact is not None  # offered only for a managed contact
+                await sync_clock(ctx, contact)
+            elif action == "adverts":
+                assert contact is not None  # offered only for a contact with a full key
+                if await _accept_adverts(ctx, contact, label):
+                    base_actions = [a for a in base_actions if a.key != "adverts"]
+                    screen.replace_info_actions(management(locked))
+                    screen.replace_info_row(
+                        "adverts", Text("accepted again — the next advert updates it", "ok")
+                    )
+            elif action == "resync":
+                assert contact is not None  # offered only for a room with a full key
+                if await _resync_room(ctx, contact, label):
+                    base_actions = [a for a in base_actions if a.key != "resync"]
+                    screen.replace_info_actions(management(locked))
+                    screen.replace_info_row(
+                        "posts", Text("asked again — the room sends what it still has", "ok")
+                    )
             elif action == "restore":
                 # A restore writes the contact back, and it ends the visit for the same reason
                 # as a delete. The page was opened from the Archived list, and the row that
@@ -1775,12 +2103,68 @@ async def open_node_detail(
                 contact_removed = await _remove_contact(ctx, contact, self_key, label)
                 if contact_removed:
                     break
+            elif isinstance(action, str) and action.startswith(_TOOL_ACTION):
+                from .menu import run_tool
+
+                await run_tool(ctx, action.removeprefix(_TOOL_ACTION))
+                # Device config can change what this page shows of our node: its name, its
+                # location, or its type. Then the page is built again from the new values.
+                fresh = await _read_self_info(ctx) if you else {}
+                if fresh and _shown_self(fresh) != _shown_self(info):
+                    reopen = True
+                    break
     if minimap is not None:
         # The braille of the preview may have left marks on the terminal (double-width
         # fallback glyphs that the diff of prompt_toolkit cannot see). Force one clean paint
         # of the list below, exactly as the full map does when it closes.
         session.request_full_repaint()
+    if reopen:
+        # The old page closed, and a new page opens in its place, one level above the same
+        # screen. Thus Esc from the new page still goes back to where the user came from.
+        return await open_node_detail(ctx, contact, manage=manage, lock=lock)
     return contact_removed
+
+
+#: The section of the main menu whose tools act on our node. The page of our node offers
+#: each tool of this section (refer to :func:`_this_node_actions`).
+THIS_NODE_SECTION = "This node"
+
+#: The start of the token of an action row that runs a tool of the main menu. The rest of
+#: the token is the name of the tool.
+_TOOL_ACTION = "tool:"
+
+#: The fields of the self-info that the page of our node shows. When a tool that the page
+#: runs changes one of them, the page is built again.
+_SHOWN_SELF_FIELDS = ("name", "public_key", "adv_lat", "adv_lon", "adv_type")
+
+
+def _this_node_actions() -> list[_Action]:
+    """One action row for each tool of the ``This node`` section of the main menu.
+
+    The rows come from the tool registry, in the order of the menu, with the icon and the
+    title of each menu row. Thus a tool that MeshTerm adds to the section, or removes from
+    it, changes the page too, and the two places always use the same words.
+    """
+    from ..tools import all_tools
+
+    return [
+        _Action(f"{_TOOL_ACTION}{tool.name}", tool.icon, "", tool.title or tool.name)
+        for tool in all_tools()
+        if tool.menu_visible and tool.category == THIS_NODE_SECTION
+    ]
+
+
+async def _read_self_info(ctx: AppContext) -> dict:
+    """The self-info of the device, or an empty dict when the device does not answer."""
+    try:
+        return await ctx.devstate.self_info()
+    except Exception:  # noqa: BLE001 - the page is useful without our identity and fix
+        return {}
+
+
+def _shown_self(info: dict) -> tuple:
+    """The values of the self-info that the page of our node shows."""
+    return tuple(info.get(field) for field in _SHOWN_SELF_FIELDS)
 
 
 def _management_rows(
@@ -2066,6 +2450,117 @@ async def _remove_contact(ctx: AppContext, contact: Contact, self_key: str, labe
     return True
 
 
+async def _accept_adverts(ctx: AppContext, contact: Contact, label: str) -> bool:
+    """Confirm, then make the device hear the adverts of this contact again.
+
+    The device refuses each advert that is not newer than the advert time that it stores.
+    That time is in the future when the clock of the node was once ahead (refer to
+    :meth:`~meshterm.core.connection.Device.accept_adverts_again`). The write changes only
+    that time, but it writes to the device, so the confirm is amber.
+
+    Args:
+        ctx: The shared application context (interactive menu).
+        contact: The contact, with a full key.
+        label: The name of the node on the page.
+
+    Returns:
+        ``True`` when the device has the lower time now (or had nothing to lower).
+        ``False`` when the user cancelled or the write failed. A failure is shown.
+    """
+    from .surface import TuiUi
+
+    assert isinstance(ctx.ui, TuiUi)  # open_node_detail makes sure of this
+    session = ctx.ui.session
+    if not await ctx.ui.dialog(
+        f"This device ignores {label}'s adverts, because its clock was once ahead. "
+        "Lower the stored advert time so its next advert updates its name, position, "
+        "and path? Older adverts stay refused.",
+        [("Cancel", False), ("Accept", True)],
+        title="Accept adverts",
+        default=1,
+        danger=True,
+    ):
+        return False
+    device = await ctx.device()
+    try:
+        await device.accept_adverts_again(contact)
+    except Exception as exc:  # noqa: BLE001 - a refused write is reported, not raised
+        ctx.log.debug("contacts: advert time not lowered for %s: %s", contact.name, exc)
+        await session.message_dialog(
+            Text(f"✗ couldn't change {label}'s advert time — {exc}", style="err"),
+            title="Accept adverts",
+        )
+        return False
+    # The table of the device changed. The next read shows the lower time.
+    ctx.devstate.invalidate_contacts()
+    return True
+
+
+async def _resync_room(ctx: AppContext, contact: Contact, label: str) -> bool:
+    """Confirm, reset the post sync of a room on the device, then log in to the room again.
+
+    The room sends only the posts after the sync time that the device gives at a login.
+    After its clock went back, each new post is older than that time (refer to
+    :func:`~meshterm.services.clock_offsets.room_posts_blocked`). The device resets the
+    time only for a new contact, so the repair removes the contact and adds the same
+    record back (:meth:`~meshterm.core.connection.Device.reset_room_sync`). Then a login
+    with the stored password asks for each post that the room still has. The room keeps
+    its posts only in memory, so a reboot lost the older ones. The chat drops the posts
+    that it already has.
+
+    Args:
+        ctx: The shared application context (interactive menu).
+        contact: The room server, with a full key.
+        label: The name of the room on the page.
+
+    Returns:
+        ``True`` when the device has the reset sync time. ``False`` when the user cancelled
+        or the device refused. A failure is shown.
+    """
+    from ..core.models import LoginResult
+    from .surface import TuiUi
+
+    assert isinstance(ctx.ui, TuiUi)  # open_node_detail makes sure of this
+    session = ctx.ui.session
+    if not await ctx.ui.dialog(
+        f"{label}'s clock went back, so it sends no post newer than the ones you have. "
+        "Remove it from this device and add it back with the same settings, then log in "
+        "again to get every post it still has?",
+        [("Cancel", False), ("Ask again", True)],
+        title="Room posts",
+        default=1,
+        danger=True,
+    ):
+        return False
+    device = await ctx.device()
+    try:
+        await device.reset_room_sync(contact)
+    except Exception as exc:  # noqa: BLE001 - a refused write is reported, not raised
+        ctx.log.warning("rooms: sync reset failed for %s: %s", contact.name, exc)
+        await session.message_dialog(Text(f"✗ {exc}", style="err"), title="Room posts")
+        return False
+    ctx.devstate.invalidate_contacts()
+    password = ctx.rooms.password(contact)
+    if password is None:
+        await session.message_dialog(
+            Text(f"Log in to {label} from Rooms to get its posts.", style="warn"),
+            title="Room posts",
+        )
+        return True
+    try:
+        async with ctx.ui.busy_overlay():
+            login = await ctx.rooms.login(contact, password)
+    except Exception as exc:  # noqa: BLE001 - the reset is done. Only the login failed
+        ctx.log.warning("rooms: login after the sync reset failed for %s: %s", contact.name, exc)
+        login = None
+    if login is None or login.result is not LoginResult.ACCEPTED:
+        await session.message_dialog(
+            Text(f"No login yet — open {label} in Rooms to log in and get its posts.", "warn"),
+            title="Room posts",
+        )
+    return True
+
+
 #: Why a repeater may not answer the regions request, in the words that the page uses.
 _REGIONS_REACH = "it answers only a neighbour, or over a known route"
 
@@ -2173,6 +2668,50 @@ def _signal_row(hn) -> Text | None:  # noqa: ANN001 - Optional[HeardNode]
     return text if text.plain else None
 
 
+def _clock_offset(ctx, node_id: str, name: str | None, key_of):  # noqa: ANN001, ANN202
+    """The clock offset of the node, or ``None`` when no packet told it.
+
+    Refer to :mod:`~meshterm.services.clock_offsets`. A failed read gives ``None``: the page
+    is useful without the clock line.
+    """
+    if not node_id:
+        return None
+    try:
+        return node_offset(ctx.repo, node_id, name=name, key_of=key_of)
+    except Exception:  # noqa: BLE001 - the page is useful without the clock line
+        return None
+
+
+def _clock_text(offset, tolerance_s: float) -> Text:  # noqa: ANN001 - a ClockOffset
+    """The value of the ``clock`` row: how far the clock is from ours, and how old that is.
+
+    The offset is in ``warn`` when it is past the ``clock_tolerance_s`` preference, so that
+    a node whose times are wrong is visible on its own page.
+    """
+    text = Text()
+    if offset.out_of_sync(tolerance_s):
+        text.append(format_offset(offset.offset_s), style="warn")
+    else:
+        text.append("in sync")
+    text.append(f"  ·  {format_ago(age_seconds(offset.last_at))}", style="muted")
+    return text
+
+
+def _blocked_text(newest_post: datetime | None) -> Text:
+    """The value of the ``posts`` row of a room whose clock went back past its newest post."""
+    text = Text("blocked — its clock went back", style="warn")
+    if newest_post is not None:
+        text.append(f"  ·  newest {newest_post.astimezone():%Y-%m-%d %H:%M}", style="muted")
+    return text
+
+
+def _refused_text(until: datetime) -> Text:
+    """The value of the ``adverts`` row: the date until which the device refuses them."""
+    text = Text(f"refused until {until.astimezone():%Y-%m-%d}", style="warn")
+    text.append("  ·  its clock was ahead", style="muted")
+    return text
+
+
 def _hop_hash(key: str | None, fallback: str, hash_bytes: int) -> str:
     """The hash of a key at ``hash_bytes`` width, or ``fallback`` when there is no usable key."""
     hex_key = (key or "").lower().removeprefix("0x")
@@ -2225,6 +2764,27 @@ def _route_line(
     each route has a length. Before, a row whose second line came and went with the
     evidence made the list one row taller when the highlight moved.
     """
+    line = _route_path_line(
+        node_label,
+        name_key,
+        hops_out,
+        resolve=resolve,
+        node_known=node_known,
+        hash_bytes=hash_bytes,
+    )
+    return line.text(), _route_context(hops_out, tag, weakest, samples)
+
+
+def _route_path_line(
+    node_label: str,
+    name_key: str,
+    hops_out: tuple[str, ...],
+    *,
+    resolve,  # noqa: ANN001 - NodeResolver, with no strict type, like the graph callbacks
+    node_known: bool,
+    hash_bytes: int,
+) -> PathLine:
+    """The path line of one route, from the contact to our node (refer to :func:`_route_line`)."""
     hash_bytes = max(hash_bytes, 1)  # an unknown mode still must have a real width to slice
 
     def hop_of(hop: str) -> PathHop:
@@ -2233,7 +2793,7 @@ def _route_line(
             return PathHop(named, key=hop)
         return PathHop(_hop_hash(hop, hop, hash_bytes))  # unknown: its hash, in the grey
 
-    path = PathLine(
+    return PathLine(
         [
             PathHop(node_label, key=name_key)
             if node_known and name_key
@@ -2241,8 +2801,13 @@ def _route_line(
             *(hop_of(hop) for hop in reversed(hops_out)),
             PathHop(SELF_GLYPH, you=True),
         ]
-    ).text()
+    )
 
+
+def _route_context(
+    hops_out: tuple[str, ...], tag: str, weakest: float | None, samples: int
+) -> Text:
+    """The line of context under one route (refer to :func:`_route_line`)."""
     atoms: list[Text] = [hops_atom(len(hops_out))]
     if weakest is not None:
         snr = Text("weakest ", style="muted")
@@ -2259,7 +2824,7 @@ def _route_line(
         if i:
             context.append("  ·  ", style="muted")
         context.append_text(atom)
-    return path, context
+    return context
 
 
 def _cluster_presentation(members: tuple[str, ...], type_of) -> _Cluster:  # noqa: ANN001
@@ -2373,7 +2938,7 @@ def _routes_view(
         return _RoutesView(note="no key to route to")
     has_evidence = (
         device_route is not None
-        or any(s.source == "observed" for s in scenarios)
+        or any(s.source in ("observed", "outbound") for s in scenarios)
         or topo.link(topo.self_id, canonical_target) is not None
     )
     if not has_evidence:
@@ -2410,25 +2975,34 @@ def _routes_view(
             add(best_hops, "best", None, 0)
     if device_route is not None:
         add(device_route, "device", None, 0)
+    # Each route through an outbound path of the user: the user named the way out, so the
+    # route gets a line also where the evidence is thin.
+    for scenario in scenarios:
+        if scenario.source == "outbound":
+            add(scenario.hops, "", scenario.weakest_snr, scenario.samples)
     for scenario in _good_alternatives(topo, scenarios, canonical_target):
         add(scenario.hops, "", scenario.weakest_snr, scenario.samples)
 
     routes: list[_Route] = []
     for hops_out, tag, weakest, samples in entries:
         spec = render_forced_spec(hops_out, target_hash, width_bytes) if target_hash else ""
-        path, context = _route_line(
+        line = _route_path_line(
             node_label,
             name_key,
             hops_out,
-            tag,
-            weakest,
-            samples,
             resolve=resolve,
             node_known=node_known,
-            self_name=self_name,
             hash_bytes=hash_bytes,
         )
-        routes.append(_Route(draw=tuple(reversed(hops_out)), spec=spec, path=path, context=context))
+        routes.append(
+            _Route(
+                draw=tuple(reversed(hops_out)),
+                spec=spec,
+                path=line.text(),
+                context=_route_context(hops_out, tag, weakest, samples),
+                line=line,
+            )
+        )
 
     # The legend explains the marks of the relays with a known type. Thus the real types of
     # the members decide it, before the contraction folds the members of a dense cluster
@@ -2482,6 +3056,7 @@ def _routes_view(
         label_of=label_of,
         label_rgb_of=cluster_label_rgb_of,
         legend=legend,
+        find=node_of(resolve),
     )
 
 

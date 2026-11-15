@@ -49,7 +49,7 @@ class TxOptimizeTool(Tool):
     title = "TX optimize"
     icon = "📶"
     help = "Tune a remote node's TX power for a target"
-    category = "Other nodes"
+    category = "Managed nodes"
     order = 20  # the same as Repeater admin: a remote radio, changed over the mesh
 
     async def prompt_params(self, ctx: AppContext) -> dict[str, Any] | None:
@@ -128,7 +128,7 @@ class TxOptimizeTool(Tool):
         Returns:
             A :class:`ToolResult` that repeats the stored summary of the sweep.
         """
-        from ..ui.admin_picker import admin_picker_rows
+        from ..ui.admin_picker import FORGET_HINT, admin_picker_rows, forget_row
         from ..ui.menus import WizardPage, run_wizard
         from ..ui.surface import TuiUi
         from ..ui.tx_screen import open_tx_optimize
@@ -149,12 +149,23 @@ class TxOptimizeTool(Tool):
         def admin_of(values: list) -> Contact:
             return next(c for c in candidates if c.name == values[0])
 
+        async def forget(value: Any) -> list | None:
+            nonlocal items
+            rows = await forget_row(ctx, contacts, value)
+            if rows is not None:
+                items = rows  # so that a turn back to this page shows the change
+            return rows
+
         def node_page(values: list) -> WizardPage:
+            # Delete on a managed node forgets its password, as in the picker of
+            # repeater admin (refer to :func:`~meshterm.ui.admin_picker.forget_row`).
             return WizardPage(
                 title="TX optimize — node to tune · step 1 of 2",
                 items=items,
                 prompt="Whose transmit power gets tuned (you need its admin password):",
                 default=values[0],
+                delete_hint=FORGET_HINT,
+                on_delete=forget,
             )
 
         def target_page(values: list) -> WizardPage | Any:
@@ -213,9 +224,13 @@ class TxOptimizeTool(Tool):
             DeviceCommandError: If the node refused the login. MeshTerm then forgets the
                 stored password, because it is known to be bad, and the next run asks
                 again. Also if the node never answered. Then the password is not tested,
-                and MeshTerm keeps it.
+                and MeshTerm keeps it. A stock node does not answer a wrong password, so
+                the error tells the user to give a changed password with ``--password``.
         """
+        from ..ui.admin_login import no_reply_error
+
         device = await ctx.device()
+        saved = not params.get("password") and ctx.admin_store.get(admin_node) is not None
         password = await self._resolve_password(ctx, admin_node, params)
         outcome = await device.admin_login(admin_node, password)
         ctx.admin_store.record(admin_node, password, outcome)
@@ -225,10 +240,7 @@ class TxOptimizeTool(Tool):
                 "The saved password was cleared; re-run to enter a new one."
             )
         if not outcome:
-            raise DeviceCommandError(
-                f"{admin_node.name!r} did not answer the admin login — it may be out of "
-                "reach or asleep. The saved password was kept; re-run when it answers."
-            )
+            raise DeviceCommandError(no_reply_error(admin_node.name, saved=saved, again="re-run"))
 
     # -- scripted (CLI) ---------------------------------------------------------------
 

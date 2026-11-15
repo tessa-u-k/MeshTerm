@@ -52,7 +52,7 @@ _PATH_SPEC = re.compile(r"[0-9a-f]+(?:,[0-9a-f]+)*")
 #: must find in each. Each command runs against only the mock companion or the database.
 _LISTINGS: list[tuple[str, list[str], list[str]]] = [
     # (command, arguments, headings or keys the output must carry)
-    ("contacts", [], ["NAME", "TYPE", "HEARD", "PKTS", "HASH", "LOCATION", "KEY"]),
+    ("contacts", [], ["NAME", "TYPE", "HEARD", "PKTS", "HASH", "LOCATION", "PLACE", "KEY"]),
     ("info", [], ["name", "public_key", "role"]),
     ("config", ["show"], ["name", "radio_freq", "tx_power"]),
     ("preferences", ["show"], ["PREFERENCE", "VALUE", "DEFAULT", "DESCRIPTION"]),
@@ -342,6 +342,13 @@ def test_a_global_option_taking_a_value_moves_with_its_value(run) -> None:  # no
     assert run("contacts", "--sort", "name", "--json").exit_code == exitcodes.OK
 
 
+@pytest.mark.parametrize("order", ["place", "hash"])
+def test_contacts_sorts_by_each_column_of_the_screen(run, order) -> None:  # noqa: ANN001
+    """``--sort`` accepts each sort column of the Contacts screen, the place and the hash too."""
+    result = run("contacts", "--sort", order, "--json")
+    assert result.exit_code == exitcodes.OK, result.output
+
+
 def test_lifting_a_global_never_steals_a_subcommands_own_help(run) -> None:  # noqa: ANN001
     """``contacts --help`` must stay the help of ``contacts``, not the help of the app.
 
@@ -382,7 +389,16 @@ def test_contacts_names_every_node_bare_and_ages_every_time(run) -> None:  # noq
     user who wants them.
     """
     header, *records = result_lines(run("contacts"))
-    assert header.split() == ["NAME", "TYPE", "HEARD", "PKTS", "HASH", "LOCATION", "KEY"]
+    assert header.split() == [
+        "NAME",
+        "TYPE",
+        "HEARD",
+        "PKTS",
+        "HASH",
+        "LOCATION",
+        "PLACE",
+        "KEY",
+    ]
     assert records, "the simulator always has contacts"
     # Read the lane at the position of its heading. Do not count words, because a value can
     # have a space (the `Lakeside BBS` of the simulator is a `room server`). The alignment,
@@ -504,7 +520,7 @@ def test_a_trace_draws_its_route_with_arrows_and_keeps_its_path_in_commas(run) -
     name like each other hop. The ``★`` of the menu says "you already know who this is".
     This is true for the user, and it is not true for a person who opens the file later.
     """
-    result = run("trace-path", "--path", "a1,d4,a1")
+    result = run("trace-path", "--path", "a1,b2,a1")
     assert result.exit_code == exitcodes.OK, result.output
     facts = dict(line.split(None, 1) for line in result_lines(result) if line and " " in line)
     assert facts["success"] == "yes"
@@ -518,9 +534,23 @@ def test_a_trace_draws_its_route_with_arrows_and_keeps_its_path_in_commas(run) -
     assert "→" not in facts["path"]
 
 
+def test_a_trace_to_a_companion_turns_at_its_relay_and_says_so(run) -> None:  # noqa: ANN001
+    """Alice is a companion, which stops a trace. The walk turns at her relay, Yagi-Repeater.
+
+    The CLI chooses the route as the menu does, and says on stderr where the walk turns.
+    stdout keeps only the answer, with the walk in its ``path`` fact.
+    """
+    result = run("trace", "--target", "Alice")
+    assert result.exit_code in (exitcodes.OK, exitcodes.NO_RESULT), result.output
+    assert "Alice can't relay a trace, so the trace turns at Yagi-Repeater" in result.stderr
+    assert "relay a trace" not in result.stdout
+    facts = dict(line.split(None, 1) for line in result_lines(result) if line and " " in line)
+    assert "," not in facts["path"] and "a1b2c3d4".startswith(facts["path"])
+
+
 def test_a_trace_reports_its_per_hop_readings_under_a_header(run) -> None:  # noqa: ANN001
     """The second block has one record for each hop. The hash joins it to the route line."""
-    lines = result_lines(run("trace-path", "--path", "a1,d4,a1"))
+    lines = result_lines(run("trace-path", "--path", "a1,b2,a1"))
     header = next(line for line in lines if line.startswith("HOP"))
     assert header.split() == ["HOP", "FROM", "TO", "SNR_DB"]
 
@@ -565,8 +595,16 @@ def test_a_failure_says_so_on_stderr_and_never_on_stdout(run) -> None:  # noqa: 
         ("config", "import-key", "00" * 32),
         ("channels", "clear", "1"),
         ("preferences", "reset"),
+        ("forget-admin-passwords",),
     ],
-    ids=["reboot", "factory-reset", "import-key", "channels-clear", "preferences-reset"],
+    ids=[
+        "reboot",
+        "factory-reset",
+        "import-key",
+        "channels-clear",
+        "preferences-reset",
+        "forget-admin-passwords",
+    ],
 )
 def test_a_destructive_command_without_yes_is_a_silent_usage_error(run, args) -> None:  # noqa: ANN001
     """A missing confirmation is a bad argument, and the message goes where errors go.
@@ -579,6 +617,30 @@ def test_a_destructive_command_without_yes_is_a_silent_usage_error(run, args) ->
     assert result.exit_code == exitcodes.USAGE
     assert result.stdout == ""
     assert "--yes" in result.stderr
+
+
+def test_forget_admin_passwords_lists_what_it_forgot_and_exits_5_on_nothing(
+    run, tmp_path: Path
+) -> None:  # noqa: ANN001
+    """GitHub issue 28: one command forgets all the stored admin passwords.
+
+    The answer is the list of the nodes that it forgot, and the ✓ goes to stderr. A second
+    run finds nothing, so it exits with ``5`` and its document is the empty array.
+    """
+    assert run("repeater-admin", "Yagi-Repeater", "ver", "--password", "admin").exit_code == 0
+    assert (tmp_path / "home" / "admin.json").read_text(encoding="utf-8").strip() != "{}"
+
+    result = run("forget-admin-passwords", "--yes")
+    assert result.exit_code == exitcodes.OK, result.output
+    header, row = result_lines(result)
+    assert header.split() == ["NAME", "LAST_LOGIN", "KEY"]
+    assert row.split()[:2] == ["Yagi-Repeater", "now"]
+    assert "forgot 1 admin password" in result.stderr
+    assert json.loads((tmp_path / "home" / "admin.json").read_text(encoding="utf-8")) == {}
+
+    again = run("--json", "forget-admin-passwords", "--yes")
+    assert again.exit_code == exitcodes.NO_RESULT
+    assert json.loads(again.stdout) == []
 
 
 def test_import_key_reads_a_file_and_keeps_the_key_out_of_the_run_log(run, tmp_path: Path) -> None:  # noqa: ANN001

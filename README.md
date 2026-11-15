@@ -27,7 +27,7 @@ run MeshTerm, the more the history of your mesh is worth.
 > change something, first say hello on [Discord](https://discord.gg/AZwe5Uvb3S).
 > [Read more about how the project is run](#how-this-project-is-run).
 
-https://github.com/user-attachments/assets/9921c756-c096-4224-9560-bb6180d895c8
+https://github.com/user-attachments/assets/3d0414dc-d3f0-491d-83b7-11686e4922f5
 
 <p align="center"><sub>A video of less than two minutes, in the demo mesh over Montréal (<code>meshterm --demo</code>).</sub></p>
 
@@ -278,10 +278,11 @@ error message that MeshTerm gives.
 
 The menu asks one question: *what would you like to do?* It gives the answer in two halves.
 Three sections name an activity. **Message** has chat, channels, the courier outbox, and
-contacts. **Watch** has the dashboard, the live feed, the watchtower, and the time machine.
+contacts. **Watch** has the dashboard, the live feed, the watchtower, the clock drift
+report, and the time machine.
 **Explore** has the map, the mesh walk, tracing, and the trophy case. The other three
-sections name the owner. **This node** is the radio in your hand. **Other nodes** is the
-someone else's radio, which you reach over the mesh. **This app** is MeshTerm itself, with
+sections name the owner. **This node** is the radio in your hand. **Managed nodes** are
+the radios that you administer over the mesh. **This app** is MeshTerm itself, with
 the preferences, the diagnostics, and the written pages.
 
 Almost all of these have a mirror `meshterm` subcommand. The same registry builds the menu

@@ -34,13 +34,13 @@ def test_advert_time_refuses_a_future_sender_clock() -> None:
     tolerance) stays: its age clamps to "now" for a short time and corrects itself. The
     usual never-heard forms (zero, absent, or garbage) still become None.
     """
-    from meshterm.core.models import ADVERT_FUTURE_SKEW_S, advert_time, utcnow
+    from meshterm.core.models import CLOCK_TOLERANCE_S, advert_time, utcnow
 
     past = int(utcnow().timestamp()) - 3600
     when = advert_time(past)
     assert when is not None and int(when.timestamp()) == past
     assert advert_time(int(utcnow().timestamp()) + 60) is not None  # normal skew
-    assert advert_time(int(utcnow().timestamp()) + ADVERT_FUTURE_SKEW_S + 60) is None
+    assert advert_time(int(utcnow().timestamp()) + CLOCK_TOLERANCE_S + 60) is None
     assert advert_time(0) is None
     assert advert_time(None) is None
     assert advert_time("garbage") is None
@@ -347,8 +347,26 @@ async def test_mock_device_blank_path_traces() -> None:
     device = MockDevice()
     await device.connect()
     # Try several times, because the simulator sometimes drops very weak links.
-    results = [await device.run_trace("Alice") for _ in range(10)]
+    results = [await device.run_trace("Yagi-Repeater") for _ in range(10)]
     assert any(r.success and r.hops for r in results)
+
+
+async def test_mock_device_node_that_does_not_relay_stops_a_trace() -> None:
+    """As on the real mesh, a simulated companion or room server never relays a trace.
+
+    Alice is a companion and Lakeside BBS is a room server. A forced walk that turns at
+    either one, or that goes through either one, never comes back. A walk that turns at
+    Alice's repeater (``a1b2``) comes back, which is the walk that Trace target gives her.
+    With no path, the simulator routes as the real device does: it turns the walk at the
+    last relay of her learned route, so the trace can come back.
+    """
+    device = MockDevice()
+    await device.connect()
+    assert not (await device.run_trace("Alice", path="a1b2,d4e5,a1b2")).success
+    assert not (await device.run_trace("Lakeside BBS", path="f6a7")).success
+    for path in ("a1b2", None):
+        results = [await device.run_trace("Alice", path=path) for _ in range(10)]
+        assert any(r.success for r in results), path
 
 
 def test_trace_timeout_scales_with_hops() -> None:
@@ -528,26 +546,34 @@ async def _setup_link(optimal_remote_tx: int = 20):
     """Return a connected mock device, the (admin, target) contacts, and the forced path.
 
     The path goes admin → target. Thus the optimizer tunes the admin node and reads the
-    SNR that the target receives from it.
+    SNR that the target receives from it. The target is a repeater, because the walk ends
+    there and must come back: a companion does not relay a trace.
     """
     device = MockDevice(optimal_remote_tx=optimal_remote_tx)
     await device.connect()
     contacts = await device.get_contacts()
     admin = next(c for c in contacts if c.name == "Yagi-Repeater")
-    target = next(c for c in contacts if c.name == "Alice")
+    target = next(c for c in contacts if c.name == "Local-Repeater")
     path = trace_runner.parse_trace_path(f"{admin.name},{target.name}", contacts)
     assert await device.admin_login(admin, "admin")
     return device, admin, target, path
 
 
 async def test_admin_login_rejects_wrong_password() -> None:
-    """The device refuses a wrong admin password, and the node stays closed to tuning."""
+    """A wrong admin password opens nothing, and the node stays closed to tuning.
+
+    A stock node does not answer a wrong password, so the simulator gives no reply. A node
+    whose firmware refuses (``_refusing``) says no.
+    """
     from meshterm.core.connection import LoginResult
 
     device = MockDevice(admin_password="secret")
     await device.connect()
     admin = (await device.get_contacts())[0]
 
+    silent = await device.admin_login(admin, "nope")
+    assert silent is LoginResult.NO_REPLY and not silent
+    device._refusing.add(admin.name)
     refused = await device.admin_login(admin, "nope")
     assert refused is LoginResult.REFUSED and not refused
     with pytest.raises(DeviceCommandError):

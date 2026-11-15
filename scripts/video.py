@@ -9,6 +9,7 @@ The script runs MeshTerm with ``--demo`` in an 80×24 terminal, as the terminal 
 
 1. The main menu.
 2. The chat on Public, and the two paths of a message from Beloeil, each selected in turn.
+   Then ^N shows the places of the nodes on the paths in place of their names.
 3. A message that arrives on Public. Then a question that mentions Dave, typed so that the
    mention becomes a chip, and his answer, which mentions our node.
 4. A trace to Brossard, across the river, and back.
@@ -381,7 +382,12 @@ def _tour(p: Presenter) -> None:
     p.key("up", pause=1.6)
     p.key("down", pause=0.6)
     p.camera.mark("poster")
-    p.hold(2.6)
+    p.hold(1.2)
+    # ^N: the same paths, with the place of each node in place of its name. The hint
+    # then offers the names again.
+    p.key(text="n", ctrl=True, pause=0.0)
+    p.wait_for("^N names")
+    p.hold(3.0)
     p.key("escape")
     p.key("escape")  # the first Esc closes the dialog, the second unpicks the message
 
@@ -427,7 +433,7 @@ def _tour(p: Presenter) -> None:
     with p.off_camera():
         p.key("enter", pause=0.0)
         capture.settle(quiet=3.0, timeout=120.0)
-    p.hold(3.0)
+    p.hold(2.5)
     for _ in range(3):
         p.key("right", pause=0.4)
     capture.settle(quiet=0.8, timeout=30.0)
@@ -441,7 +447,7 @@ def _tour(p: Presenter) -> None:
         p.key("pageup", pause=0.0)
         capture.settle(quiet=0.6, timeout=30.0)
         p.hold(0.9)
-    p.hold(3.0)
+    p.hold(2.5)
 
     print("a repeater administered over the air", flush=True)
     _menu(p, "repeater a")
@@ -490,7 +496,7 @@ def _tour(p: Presenter) -> None:
     print("the live feed, and one packet", flush=True)
     _menu(p, "live f")
     p.wait_for("Live feed")
-    p.hold(3.0)
+    p.hold(2.5)
     for _ in range(3):
         p.key("down", pause=0.5)
     p.hold(0.5)

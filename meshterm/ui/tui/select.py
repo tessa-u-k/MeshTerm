@@ -271,6 +271,11 @@ class Separator:
             row: its first two cells are the pointer column, which does not move while the
             rest slides. :func:`~meshterm.ui.menus.column_header` already indents it in this
             way.
+        hscroll_from: The cells after the pointer column that stay still while the header
+            pans (only for a header that pans). A table whose rows pin a head block
+            (:attr:`Choice.hscroll_from`) gives its header the same count. Thus the labels
+            of the pinned lanes stay over their cells. With ``0``, the default, only the
+            pointer column stays.
     """
 
     title: str | Text | Callable[[int], str | Text]
@@ -279,6 +284,7 @@ class Separator:
     heading: bool = False
     spaced: bool = False
     pans: bool = False
+    hscroll_from: int = 0
 
     def text(self, width: int) -> str | Text:
         """The content of the row at ``width`` cells. This method resolves a width-aware title."""
@@ -517,7 +523,15 @@ class SelectScreen(Screen):
                 self._index = i
                 return
 
-    def turn_page(self, items: list, *, title: str, prompt: str = "", default: Any = None) -> None:
+    def turn_page(
+        self,
+        items: list,
+        *,
+        title: str,
+        prompt: str = "",
+        default: Any = None,
+        delete_hint: str = "",
+    ) -> None:
         """Show a different list in the same box: the next or previous page of a stepped dialog.
 
         This is the other way that the rows of a list change while the user looks at them.
@@ -532,6 +546,8 @@ class SelectScreen(Screen):
         - The highlight goes to ``default`` or to the first row. (A page that the user turns
           back to offers its previous answer, exactly as a step of
           :func:`~meshterm.ui.menus.run_steps` does.)
+        - The Delete key is the key of the new page. A page that removes nothing gets no
+          ``Del`` atom and no ``Delete`` chip on the F-key lane.
 
         Args:
             items: The rows of the new page, in the order to show.
@@ -539,7 +555,10 @@ class SelectScreen(Screen):
                 is.
             prompt: The instruction above the rows, or ``""`` for none.
             default: The choice value to highlight, if it is present.
+            delete_hint: The ``Del`` atom of the new page (refer to the argument of the
+                same name of :class:`SelectScreen`), or ``""`` for none.
         """
+        self._delete_hint = delete_hint
         self._items = items
         if self._hscroll_auto:
             self._hscroll = any(getattr(item, "hscroll_from", 0) > 0 for item in items)
@@ -878,7 +897,7 @@ class SelectScreen(Screen):
                     # Its fullest form, slid with the rows, with its pointer column held
                     # still. It is one line, however wide, because its labels must stay above
                     # their lanes.
-                    slid = self._scroll_window(content, _POINTER, width)
+                    slid = self._scroll_window(content, _POINTER + item.hscroll_from, width)
                     drawn = [render_to_ansi(slid, width, no_wrap=True)]
                     if item.pinned:
                         self._pinned_header = (len(lines), drawn[0])
@@ -1021,7 +1040,7 @@ class SelectScreen(Screen):
                 continue
             if isinstance(item, Separator):
                 cells = cell_len(_plain(item.text(_UNBOUNDED)))
-                limit = max(limit, tail(cells, _POINTER, width))
+                limit = max(limit, tail(cells, _POINTER + item.hscroll_from, width))
             else:
                 cells = cell_len(_plain(item.scroll_text(avail)))
                 limit = max(limit, tail(cells, item.hscroll_from, avail))

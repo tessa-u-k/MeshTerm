@@ -50,6 +50,8 @@ _STORES = (
     "settings.json",
     "adverts.json",
     "devices.json",
+    "places.json",
+    "outbound.json",
 )
 
 

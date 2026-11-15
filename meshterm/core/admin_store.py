@@ -152,6 +152,11 @@ class AdminStore:
         down at that time, MeshTerm deleted its password. The node sent nothing at all, and
         MeshTerm read that silence as a refusal.
 
+        A stock node never refuses: it does not answer a wrong password. Thus a password
+        that the owner changed also stays here after its silence. The caller then offers a
+        new password, which replaces this one when the node accepts it (refer to
+        :mod:`meshterm.ui.admin_login`).
+
         The callers still write their own messages (the sweep says "sweep again", the CLI
         says "re-run"), but no caller makes this decision.
 
@@ -176,6 +181,29 @@ class AdminStore:
         records = self._load()
         if records.pop(admin_key(node), None) is not None:
             self._write(records)
+
+    def credentials(self) -> list[AdminCredential]:
+        """Return all the remembered passwords, in the order of the file.
+
+        The list includes the password of a node that the device does not know any more,
+        because the store keys a password by the node and not by the contact list.
+        """
+        return list(self._load().values())
+
+    def forget_all(self) -> list[AdminCredential]:
+        """Delete all the remembered passwords.
+
+        Each next login asks for the password again. The method writes the file only when
+        it held a password.
+
+        Returns:
+            The credentials that the store forgot. The list is empty when the store held
+            none.
+        """
+        records = self._load()
+        if records:
+            self._write({})
+        return list(records.values())
 
     def _write(self, records: dict[str, AdminCredential]) -> None:
         """Store ``records`` atomically, with owner-only permissions where they are supported."""

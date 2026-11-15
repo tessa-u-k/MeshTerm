@@ -74,6 +74,7 @@ them instead of hand-rolling:
 | Term | Meaning |
 |---|---|
 | node | any device on the mesh — a radio broadcasting packets; roles: companion, repeater, room server, sensor. The umbrella term |
+| managed node | a node whose admin password MeshTerm stores (`admin_store`) — the user can log in to it without a prompt. Marked `🔑` (`marks.MANAGED_ICON`, `*` on the PicoCalc) beside the type mark in the Contacts list, the admin picker, and the node page header; the first list on the Clock drift page, under its histogram. The menu section of the admin tools is **Managed nodes** (JP, 2026-11-03; it was "Other nodes") |
 | contact | a node your device knows: **discovered** (heard broadcasting, not yet added) or **added** (in the contact list, messageable). Every contact is a node; not every node is a contact |
 | heard | received from ("last heard", "first heard") — never "seen" in UX text |
 | key | the full fixed-length value — a node's public key, a channel secret |
@@ -81,8 +82,10 @@ them instead of hand-rolling:
 | path | an ordered hop spec you compose or force (`a1,3d,…`) |
 | route | the concrete node sequence a trace walked or will walk |
 | via | prefix for a packet/message's relay chain |
+| location | the coordinates a node advertises (latitude, longitude) — `Set location`, the location preview, ^L locate |
+| place | the named area nearest a node's location: a neighbourhood, a village, a peak (`core/places.py`, `services/places.py`). Read as *fine, coarse* (`Villeray, Montréal`); a village, town, city or peak stands alone; a path chip shows the fine part. Found from the map tiles, then Nominatim (`place_source`); a place the user typed wins. Never "location name" |
 | region | a named area a repeater relays floods for (`region put yul`); shown bare, never `#yul` — the `#` belongs to key derivation only |
-| scope | the region a flood is limited to — a packet's, a channel's send scope, the device's default scope. A direct packet has none. MeshCore's sense and the only one: the menu's This node / Other nodes / This app sections name *whose* a setting is, never a "scope" |
+| scope | the region a flood is limited to — a packet's, a channel's send scope, the device's default scope. A direct packet has none. MeshCore's sense and the only one: the menu's This node / Managed nodes / This app sections name *whose* a setting is, never a "scope" |
 | unscoped | a plain flood, relayed by any repeater that allows the wildcard `*` |
 | room | a room server's message board — what you *join*, read, and *post* to. The node is the *room server*; the people let in are its *members*, at an *access* of member, admin, or read-only. Its two passwords are the *room password* and the *admin password* |
 | post | a message on a room's board, filed under its *author*: the key prefix the room signs it with, named by whatever names that key. A room's other traffic (its command replies) shares its key and is never a post |
@@ -432,6 +435,20 @@ as a grouped list does. Filling a page in is editing its `.md`; no Python follow
 
 - Status marks (single-width, themed): `✓` ok · `✗` err · `⚠`/`?` warn · `●` unread/
   unacked (err) · `○` acked/empty (muted). Never `✔`, `✖`, `✅`, `❌` as status.
+- **A corrected time wears `?`** (warn), in the cell after it (JP, 2026-11-02). A
+  received message keeps two times: the *sender time* (the sender's clock, a claim) and
+  the *arrival time* (ours, `received_at`). Past `clock_tolerance_s` apart the sender
+  time is wrong, and the line shows the arrival time instead, `12:31?` — never a guess at
+  the real send. A room post or a message from the companion's queue (`waited`) arrived
+  at an unknown time, so only a sender time in the future convicts it. On the picked
+  message a line under the body says what the sender's clock wrote and how far off it is
+  (`? its clock: 2024-01-01 03:12 · 1y 44w behind`). Everything about *our* side —
+  heard times, list order, activity, the packet-log search — reads the arrival time
+  (`ChatMessage.arrived_at`, SQL `_ARRIVED_AT`), never `created_at` alone. The CLI's
+  plain `TIME` carries the same `?`; its JSON gives `created_at`, `received_at`, and
+  `clock_corrected`. Channel rows from before schema 21 get their arrival once from the
+  packet log (`services/arrival_backfill.py`: a stored GRP_TXT with the same text *and*
+  sender time is the message, its first copy the arrival); a DM has no such proof.
 - Node types (shared with the map): `★` you (white) · `●` companion · `▲` repeater ·
   `■` room server · `◉` sensor · `○` unknown. **Every type mark is white** (JP,
   2026-10-14; they were pink, violet, white, orange): the shape is the type. Each keeps its
@@ -470,9 +487,11 @@ as a grouped list does. Filling a page in is editing its `.md`; no Python follow
   can't tell apart: under `pathline.SEAM_BLUR` apart in OKLab (`ui/oklab.py`, THE
   perceptual colour distance — never a hue gap, never sRGB, both of which mis-size the
   greens against the cyans). There the seam is the **thin** chevron (`POWERLINE_THIN`)
-  in the previous chip's label colour, drawn on the next, so the ribbon runs on unbroken
-  and the join is a line the chip draws
-  on itself, never a wedge of page cut out of the route and never a third colour. An
+  halfway between the previous chip's label and fill (OKLab, `oklab.midpoint`; JP,
+  2026-10-29 — it was the label itself), drawn on the next, so the ribbon runs on
+  unbroken and the join is a line the chip draws on itself out of its own pair, never a
+  wedge of page cut out of the route. The PicoCalc keeps the label: it has no slot
+  between a bright hue and its dim twin (`pathline._slot_seam`). An
   elision breaks the ribbon rather than joining it — bare `⋯`
   on the page between a closing point and the next chip's notch, no fill, no padding.
 - The ribbon's **outer ends**: the chevron means *the route continues*, so an end that is
@@ -554,6 +573,11 @@ as a grouped list does. Filling a page in is editing its `.md`; no Python follow
   colour that carries no meaning is on its way out.
 - Node names are always coloured: `name_style(name, key)` palette hue, derived from the
   node's key (its first byte — any known prefix agrees) so a rename keeps the colour.
+  The truecolor wheel keeps the old HSV wheel's hue angles at **one OKLab lightness**
+  (`theme._NODE_LIGHTNESS` 0.72, JP on a ladder, 2026-10-29): HSV ran blue names at L 0.55
+  and yellow at 0.93, so chip contrast ran APCA 19–64; now every name reads equally light
+  and every chip ~34–41. `_NODE_SPECTRUM` is the written-out table (import cost on the
+  handhelds); `tests/test_node_spectrum.py` holds it to `_spectrum_hex`.
   One rule on **every** platform; only the resolution changes (see **Platforms**).
   A surface holding only a name resolves it first (`make_name_key_resolver`); a node no
   key can place — an unresolved sender, a name two keys used within `name_overlap_days`
@@ -667,7 +691,7 @@ the whole answer in a dialect nobody else could reuse.
   the caller named the key) and the acknowledgement, through `shape=SILENT`.
 - `ui/fields.py` — **the shared shapes, one constructor per concept**: `node`, `channel`,
   `position`, `route`, `spec`, `when`, `instant`, `snr`, `flag`, `free`. A listing that
-  mentions a node asks for `fields.node`, so every document speaks the same five-key object
+  mentions a node asks for `fields.node`, so every document speaks the same six-key object
   and every listing names its lanes the same way — by construction, not by review.
   `fields.node` is the one that earns the design: **one machine key expands to as many
   plain columns as the surface has room for**, four in `contacts` and one in a hop table.

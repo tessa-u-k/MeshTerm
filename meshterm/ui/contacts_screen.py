@@ -2,11 +2,13 @@
 """The interactive Contacts screen: the contacts of the device in the shared sortable list.
 
 This screen shows the contact table of the companion with the presentation of the Time
-Machine picker. It has the same aligned ``NAME · HEARD · PKTS · KEY`` lanes, with our node
-pinned first. It has the same Ctrl+arrow sort (now with the key column) and the same
-type-to-filter. Thus the whole app has one contact list, for each source of data (refer to
-:mod:`~meshterm.ui.contactlist`). Enter opens the full-screen Node detail page of the
-highlighted node (:mod:`~meshterm.ui.node_detail_screen`). That page shows the identity of
+Machine picker. It has the same aligned ``NAME · HEARD · PKTS · PLACE · KEY`` lanes, with our
+node pinned first. It has the same Ctrl+arrow sort (now with the place and key columns) and
+the same type-to-filter. The filter also matches the place of a node. The list cuts no value:
+a row that is wider than the terminal pans with ←→. Thus the whole app has one contact list,
+for each source of data (refer to :mod:`~meshterm.ui.contactlist`). Enter opens the
+full-screen Node detail page of the highlighted node
+(:mod:`~meshterm.ui.node_detail_screen`). That page shows the identity of
 the node, a preview of its location, the routes that MeshTerm observed to it, and the ways
 to go further (trace, map, Time Machine). When the user backs out of that page, the list is
 as it was. ^L opens the map on the highlighted node, when it has a location. ^K locks the
@@ -25,10 +27,11 @@ candidate, because it is not in the contact table of the device.
 
 MeshTerm never hides what a sweep took. **View archived contacts** is directly under the
 archive action. It opens the archived list (refer to :mod:`~meshterm.ui.archived_screen`).
-This is its own screen, with the same lane layout, sorted on its own ``NAME · ARCHIVED ·
-KEY`` columns. It is a screen and not a section at the end of this screen, because it is a
-different list with different columns. An archived contact has no live heard age or packet
-count that is worth a lane. What it does have, the time that it left, has no column here.
+This is its own screen, with the same lane layout, sorted on its own ``NAME · PLACE ·
+ARCHIVED · KEY`` columns. It is a screen and not a section at the end of this screen,
+because it is a different list with different columns. An archived contact has no live
+heard age or packet count that is worth a lane. What it does have, the time that it left,
+has no column here.
 
 To remove *one* named contact for good belongs to that contact and not to the list. It is
 the last action on the Node detail page of the contact, where the user already looks at
@@ -44,7 +47,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .archived_screen import open_archived
-from .contactlist import ContactListScreen, ContactRow
+from .contactlist import CONTACTS_LANES, ContactListScreen, ContactRow
 from .menus import icon_lane, marked_label, splice_if_room
 from .sweep_screen import archive_contacts
 from .tui import Choice, KeyRequest, Separator
@@ -54,6 +57,7 @@ from .widgets import ContactsSort, contact_packets
 if TYPE_CHECKING:
     from ..context import AppContext
     from ..core.models import Contact
+    from ..services.places import PlaceService
     from .map_render import MapMarker
     from .map_screen import Locator
 
@@ -119,6 +123,8 @@ class ContactsScreen(ContactListScreen):
         locked: frozenset[str] = frozenset(),
         locator: Locator | None = None,
         can_lock: bool = False,
+        managed: frozenset[str] = frozenset(),
+        places: PlaceService | None = None,
     ) -> None:
         """Create the contacts screen over contact data that MeshTerm already got.
 
@@ -145,11 +151,19 @@ class ContactsScreen(ContactListScreen):
                 :class:`~meshterm.ui.map_screen.Locator`). With ``None``, ^L does nothing.
             can_lock: Whether the caller can store a lock, for ^K. With ``False``, ^K does
                 nothing.
+            managed: The full keys (lowercase hex) of the managed nodes: the contacts whose
+                admin password MeshTerm stores. Each of those rows has the ``🔑`` in its
+                mark column (refer to :data:`~meshterm.ui.marks.MANAGED_ICON`).
+            places: The places of the nodes, for the ``PLACE`` lane and for the filter. With
+                ``None``, the lane shows a faint ``—`` in each row. The list draws the
+                rows again when a place changes (refer to
+                :meth:`~meshterm.ui.contactlist.ContactListScreen.render_body`).
         """
         self._self_name, self._self_key = self_name, self_key
         self._locator = locator
         self._can_lock = can_lock
         self._locked = locked
+        self._managed = managed
         self._contacts, self._counts = contacts, counts
         rows = self._contact_rows_for(locked)
         # The maintenance actions close the list, after each contact, for each sort. First
@@ -192,6 +206,9 @@ class ContactsScreen(ContactListScreen):
             sort=sort,
             tail=tail,
             key_hint=lambda value: "^L map" if self._marker_of(value) is not None else "",
+            lanes=CONTACTS_LANES,
+            pan=True,
+            places=places,
         )
         if archived:
             self.short_title = f"Contacts · {known} + {archived}"
@@ -211,6 +228,7 @@ class ContactsScreen(ContactListScreen):
                     last_seen=c.last_seen,
                     count=contact_packets(c, self._counts),
                     locked=(c.public_key or "").lower().removeprefix("0x") in locked,
+                    managed=(c.public_key or "").lower().removeprefix("0x") in self._managed,
                 )
             )
         return rows
@@ -281,6 +299,17 @@ class ContactsScreen(ContactListScreen):
         """
         self._locked = locked
         self.update_rows(self._contact_rows_for(locked))
+
+    def refresh_self(self, name: str, key: str) -> None:
+        """Draw the row of our node again in place, after our page can change our name.
+
+        The page of our node runs Device config, which can rename our node. Our row is
+        still the same row, so the highlight, the sort, the scroll, and a typed filter stay.
+        """
+        if (name, key) == (self._self_name, self._self_key):
+            return
+        self._self_name, self._self_key = name, key
+        self.update_rows(self._contact_rows_for(self._locked))
 
 
 def _with_opp(slot, label: str, action: str, enabled: bool):  # noqa: ANN001, ANN202 - an FPair
@@ -360,6 +389,8 @@ async def open_contacts(
             locked=_locked_keys(ctx, self_key),
             locator=locator,
             can_lock=_can_lock(ctx, self_key),
+            managed=managed_keys(ctx, contacts),
+            places=getattr(ctx, "places", None),
         )
 
     screen = build()
@@ -413,6 +444,19 @@ async def open_contacts(
                 if await open_node_detail(ctx, None if chosen == YOU else chosen):
                     rebuild = True
                     break
+                if chosen == YOU:
+                    # Our page runs the tools of the "This node" section. Device config can
+                    # rename our node, so our row reads the name again. The cache answers
+                    # when nothing changed, so this costs no read from the radio.
+                    try:
+                        info = await ctx.devstate.self_info()
+                    except Exception:  # noqa: BLE001 - our row keeps the name that it has
+                        info = {}
+                    if info:
+                        self_name = str(info.get("name") or "this node")
+                        self_key = str(info.get("public_key") or "")
+                        screen.refresh_self(self_name, self_key)
+                    continue
                 # The page can lock or unlock the contact without an end to the visit. The
                 # store answers from memory, so MeshTerm only draws the padlocks again.
                 screen.refresh_locks(_locked_keys(ctx, self_key))
@@ -443,6 +487,26 @@ def _toggle_lock(ctx: AppContext, self_key: str, contact: Contact) -> None:
     store = ctx.contact_store
     dev_pub = self_key.lower().removeprefix("0x")
     store.set_locked(dev_pub, contact, not store.is_locked(dev_pub, contact.public_key))
+
+
+def managed_keys(ctx: AppContext, contacts: list[Contact]) -> frozenset[str]:
+    """The full keys of the managed nodes among ``contacts``: those with a stored admin password.
+
+    Args:
+        ctx: The shared application context. Its ``admin_store`` holds the passwords.
+        contacts: The contacts to examine.
+
+    Returns:
+        The keys in lowercase hex. Empty when the context has no admin store.
+    """
+    store = getattr(ctx, "admin_store", None)
+    if store is None:
+        return frozenset()
+    return frozenset(
+        (c.public_key or "").lower().removeprefix("0x")
+        for c in contacts
+        if c.public_key and store.get(c) is not None
+    )
 
 
 def _locked_keys(ctx: AppContext, self_key: str) -> frozenset[str]:

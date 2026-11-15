@@ -69,6 +69,32 @@ def node_type_label(node_type: int | None) -> str | None:
     return NODE_TYPE_LABELS.get(int(node_type), f"type {node_type}")
 
 
+#: The advert types whose stock firmware does not relay a packet. A trace comes back only
+#: when each node of its path relays it (``allowPacketForward`` in ``Mesh.cpp``). Thus a
+#: trace cannot turn at one of these nodes. The defaults of the firmware:
+#:
+#: * A companion relays only with "client repeat" on. This setting is off by default, and
+#:   the firmware accepts it only on the off-grid frequencies (433.000, 869.495, and
+#:   918.000 MHz).
+#: * A room server and a sensor relay only when their admin sets ``disable_fwd`` off. It
+#:   is on by default.
+#:
+#: MeshTerm cannot read these settings on a remote node. Thus it uses the defaults.
+_NO_RELAY_TYPES = frozenset({NODE_TYPE_CHAT, NODE_TYPE_ROOM, NODE_TYPE_SENSOR})
+
+
+def relays_traces(node_type: int | None) -> bool:
+    """Whether a node of this advert type relays a trace, so that a trace can turn at it.
+
+    A repeater relays. A companion, a room server, and a sensor do not, by default (refer
+    to :data:`_NO_RELAY_TYPES`). A trace to such a node turns at the last relay before it.
+    The route that the trace walks out is then the full route to the node, because the node
+    itself is never a hop of its own route. An unknown type returns ``True``: MeshTerm
+    cannot tell, so it traces the node itself, as it did before it knew the rule.
+    """
+    return node_type not in _NO_RELAY_TYPES
+
+
 class LoginResult(Enum):
     """How an admin login ended, and also whether the node was there to end it.
 
@@ -82,6 +108,11 @@ class LoginResult(Enum):
     tells nothing about the password: the node may be asleep or out of range, or the reply
     may be lost on its way back. Thus the credential must stay after a silence.
 
+    But a stock repeater or room server never refuses. It sends no reply at all for a
+    wrong password. Thus a password that the owner changed also comes back as silence, and
+    the menu offers the user a new password when a stored one gets no reply (refer to
+    :mod:`meshterm.ui.admin_login`).
+
     The value is truthy only when the session opened. Thus the old idiom
     ``if not await device.admin_login(...)`` still means "we are not logged in". The code
     tells the two failures apart by identity. Thus each call site must say which failure
@@ -90,10 +121,11 @@ class LoginResult(Enum):
 
     #: The node accepted the password. An admin session is open.
     ACCEPTED = "accepted"
-    #: The node answered and said no. The stored password is wrong. Forget it.
+    #: The node answered and said no. The stored password is wrong. Forget it. Only
+    #: firmware other than stock MeshCore gives this result.
     REFUSED = "refused"
-    #: No reply came back. The node is out of range or asleep, or the reply was lost. Keep
-    #: the password.
+    #: No reply came back. The node is out of range or asleep, the reply was lost, or the
+    #: password is wrong (a stock node does not answer a wrong password). Keep the password.
     NO_REPLY = "no_reply"
 
     def __bool__(self) -> bool:
@@ -239,14 +271,30 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-#: The maximum time (in seconds) that an advert timestamp can be in the future. After this
-#: limit, MeshTerm refuses the timestamp as false. The clock of the sender writes the
-#: timestamp of an advert, and a mesh node with no time source can be wrong by minutes, or
-#: by months. A skew of a few minutes is usual and causes no problem (the age clamps to
-#: "now" until the real time catches up). But if MeshTerm accepts a larger skew, that skew
-#: pins the contact at the top of each list sorted by heard time. The contact then shows
-#: "now" for as long as the false timestamp stays ahead of the wall clock.
-ADVERT_FUTURE_SKEW_S = 300
+#: The default of the ``clock_tolerance_s`` preference: how far (in seconds) the clock of a
+#: node can be from our clock before MeshTerm calls its time wrong. The clock of the sender
+#: writes the time in an advert and in a message, and a mesh node with no time source can be
+#: wrong by minutes, or by months. A difference of a few minutes is usual and causes no
+#: problem (an age clamps to "now" until the real time catches up). A larger difference is
+#: a fault. An advert time past this limit in the future pins the contact at the top of each
+#: list sorted by heard time, and a message time past it puts the message on the wrong day.
+#: Read the value through :func:`clock_tolerance_s`, never this constant.
+CLOCK_TOLERANCE_S = 300
+
+
+def clock_tolerance_s() -> int:
+    """The ``clock_tolerance_s`` preference: how far a clock can be off and still be correct.
+
+    The import is here and not at the top, because :mod:`~meshterm.core.preferences`
+    imports this module for its defaults.
+
+    Returns:
+        The tolerance in seconds.
+    """
+    from . import preferences
+
+    return int(preferences.current().clock_tolerance_s)
+
 
 #: How close together (in days) two keys must use one name before MeshTerm calls the name
 #: unsure. A name is a label that the owner of a key chooses, and a new key for the same
@@ -267,7 +315,7 @@ def advert_time(last_advert: object) -> datetime | None:
     both go through it. Thus the plausibility rule is in one place. The clock of the node
     that advertised writes the value, so the value is hearsay. A value that is zero, absent,
     or garbage means "never heard". A timestamp that is more than
-    :data:`ADVERT_FUTURE_SKEW_S` ahead of our clock comes from a sender clock that is set
+    :func:`clock_tolerance_s` ahead of our clock comes from a sender clock that is set
     incorrectly, and the function refuses it in the same way. Callers that have their own
     evidence of reception (stored observations) use that evidence to fill the ``None``
     result. A true "when we heard it" is better than a false "heard in the future".
@@ -287,9 +335,38 @@ def advert_time(last_advert: object) -> datetime | None:
     if seconds <= 0:
         return None
     when = datetime.fromtimestamp(seconds, tz=timezone.utc)
-    if when > utcnow() + timedelta(seconds=ADVERT_FUTURE_SKEW_S):
+    if when > utcnow() + timedelta(seconds=clock_tolerance_s()):
         return None
     return when
+
+
+def advert_gate(last_advert: object) -> datetime | None:
+    """The stored advert time of a contact when it is in the future, or ``None``.
+
+    This is the other half of :func:`advert_time`. That function refuses a time in the
+    future as a fact about *when we heard* the node. This function keeps it, because it is
+    a fact about the *device*. MeshCore's ``onAdvertRecv`` drops each advert whose time is
+    not newer than the stored one, as a possible replay. Thus a node whose clock was once
+    ahead, and was then set correctly, is not heard again until the real time passes the
+    stored time. That can take months.
+
+    Args:
+        last_advert: The raw ``last_advert`` field from a contact payload.
+
+    Returns:
+        The stored time, when it is more than :func:`clock_tolerance_s` ahead of our clock.
+    """
+    try:
+        seconds = int(last_advert)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    try:
+        when = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return when if when > utcnow() + timedelta(seconds=clock_tolerance_s()) else None
 
 
 @dataclass(slots=True)
@@ -313,6 +390,11 @@ class Contact:
             means that the firmware thinks that the contact is a direct neighbour (a
             zero-hop route). ``None`` means that the device learned no route (or that the
             transport did not report one).
+        adverts_refused_until: The advert time that the device stores for this contact,
+            when that time is in the future (refer to :func:`advert_gate`). The firmware
+            refuses each advert that is not newer than the stored one, as a replay. Thus,
+            after the owner corrects a clock that was ahead, the device drops each new
+            advert of the node until this time. ``None`` when nothing is refused.
     """
 
     name: str
@@ -323,6 +405,7 @@ class Contact:
     lat: float | None = None
     lon: float | None = None
     route_hops: tuple[str, ...] | None = None
+    adverts_refused_until: datetime | None = None
 
     @property
     def has_location(self) -> bool:
@@ -338,6 +421,30 @@ class Contact:
     def is_room(self) -> bool:
         """Whether this contact advertises as a room server (refer to :func:`is_room`)."""
         return is_room(self.node_type)
+
+
+#: The most bytes that the route of one contact can have in the firmware (``MAX_PATH_SIZE``).
+#: The hop limit is this number divided by the bytes of each hash.
+ROUTE_MAX_BYTES = 64
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredRoute:
+    """The two routes that one path discovery found between our node and a contact.
+
+    A path discovery is one flood request. The first copy that reached the contact
+    traveled on :attr:`out_hops`, and the first copy of the answer that reached us traveled
+    on :attr:`in_hops`. A radio link is not symmetric, so the two routes can be different.
+
+    Attributes:
+        out_hops: The route from our node to the contact: one hex hash for each relay, in
+            order from us outward. An empty tuple means no relay (a neighbour).
+        in_hops: The route from the contact to our node: one hex hash for each relay, in
+            order from the contact toward us.
+    """
+
+    out_hops: tuple[str, ...]
+    in_hops: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -360,6 +467,9 @@ class MapMarker:
         key: The key of the node in hex (the longest form that the caller has). The hue
             of the label comes from this key. ``None`` leaves the label in the muted grey
             for a node with no key.
+        place: The full label of the place of the node (``Villeray, Montréal``), or ``""``
+            when the caller has none. The map does not draw it. The find filter of the map
+            matches it, in the same way as it matches the label.
     """
 
     label: str
@@ -369,6 +479,16 @@ class MapMarker:
     is_self: bool = False
     detail: str = ""
     key: str | None = None
+    place: str = ""
+
+    def matches(self, needle: str) -> bool:
+        """Whether the find filter ``needle`` matches the label or the place of this node.
+
+        Args:
+            needle: The text that the user typed, already case-folded. An empty ``needle``
+                matches each node.
+        """
+        return not needle or needle in self.label.casefold() or needle in self.place.casefold()
 
     def _rank(self) -> int:
         """Draw order: our node above the repeaters, and the repeaters above leaf nodes."""
@@ -473,6 +593,11 @@ class Message:
             room. A post from the backlog comes long after that time.
         snr: The signal-to-noise ratio (dB) of the reception, if reported.
         received_at: When the companion delivered the message to us.
+        waited: Whether the message came out of the queue of the companion when MeshTerm
+            connected. The companion keeps each message that arrives while no app is
+            connected, and it gives no time of arrival with it. Thus the message arrived at
+            an unknown time before :attr:`received_at`, and only a sender time in the
+            future is proof of a wrong clock.
         author: For a room post: the key prefix of the author, in lowercase hex. A room
             post is a direct message from a room server, signed with the first four bytes
             of the key of its writer. The room is the :attr:`sender` (it is the node that
@@ -488,6 +613,7 @@ class Message:
     sender_timestamp: datetime | None = None
     snr: float | None = None
     received_at: datetime = field(default_factory=utcnow)
+    waited: bool = False
     author: str | None = None
     raw: dict | None = None
 
@@ -600,7 +726,16 @@ class ChatMessage:
             ``False``: sent but not acknowledged (the user can try again). ``None``: the
             ack is still expected, or the state does not apply (a channel broadcast or an
             inbound message).
-        created_at: When the message was sent or received.
+        created_at: The time that the message carries. For our own messages, it is our
+            clock when we sent the message. For a received message, it is the sender time:
+            the clock of the sender when it composed the message. That clock can be wrong
+            (refer to :meth:`corrected`).
+        received_at: The arrival time of a received message: our clock when MeshTerm got
+            it from the companion. ``None`` for our own messages, and for each message
+            stored before MeshTerm kept this time.
+        waited: Whether a received message came out of the queue of the companion when
+            MeshTerm connected (refer to :attr:`Message.waited`). It then arrived at an
+            unknown time before :attr:`received_at`.
         row_id: The primary key in the ``messages`` table, after MeshTerm stores the
             message. MeshTerm uses it to update the delivery state of an outbound message
             in place, when the user tries again. ``None`` until the message is stored.
@@ -613,6 +748,12 @@ class ChatMessage:
             messages. This includes our own posts, which a room never sends back. It also
             includes the command-line replies of a room, which have its conversation key
             but are not posts (refer to :attr:`is_post`).
+        flood: How the device sent our last transmission of an outbound direct message:
+            ``True`` to the whole mesh, ``False`` along the route that it learned. ``None``
+            when the device did not tell, and for each message that is not our own direct
+            message. MeshTerm does not store this value. A message that is loaded from the
+            history has ``None``. The chat uses it to decide whether ^R offers a retry by
+            flood (a route that gets no ack can be stale, and a flood goes around it).
     """
 
     text: str
@@ -625,14 +766,90 @@ class ChatMessage:
     snr: float | None = None
     acked: bool | None = None
     created_at: datetime = field(default_factory=utcnow)
+    received_at: datetime | None = None
+    waited: bool = False
     row_id: int | None = None
     scope: str | None = None
     author: str | None = None
+    flood: bool | None = field(default=None, compare=False)
 
     @property
     def is_post(self) -> bool:
         """Whether this is an inbound room post, by the member that :attr:`author` names."""
         return self.author is not None
+
+    @property
+    def arrived_at(self) -> datetime:
+        """The best time on our clock for when this message came to us.
+
+        Use this time for everything that is about our side: when we heard the sender, the
+        order of the conversations, and the search of the packet log. A sender time is only
+        a claim, and a node with a wrong clock makes it false. The rules:
+
+        * Our own message: :attr:`created_at`, which our clock wrote.
+        * A received message with an arrival time: :attr:`received_at`.
+        * A message that waited in the companion: the earlier of the sender time and the
+          arrival time. It arrived before MeshTerm got it, but MeshTerm does not know how
+          long before.
+        * A message stored before MeshTerm kept the arrival time: :attr:`created_at`.
+
+        The SQL form of these rules is ``_ARRIVED_AT`` in
+        :mod:`~meshterm.persistence.repository`. The two must agree.
+        """
+        if self.received_at is None:
+            return self.created_at
+        if self.waited and self.created_at < self.received_at:
+            return self.created_at
+        return self.received_at
+
+    @property
+    def clock_offset_s(self) -> float | None:
+        """The sender time minus the arrival time, in seconds, or ``None`` if not known.
+
+        A positive value means that the clock of the sender is ahead of ours. The value is
+        ``None`` for our own messages and for a message with no arrival time. A packet
+        takes only seconds to arrive, so the value is the error of the sender's clock.
+        """
+        if self.outbound or self.received_at is None:
+            return None
+        return (self.created_at - self.received_at).total_seconds()
+
+    def corrected(self, tolerance_s: float) -> bool:
+        """Whether the sender time is wrong, so that the screen shows the arrival time.
+
+        A sender time is wrong when it is more than ``tolerance_s`` from the arrival time.
+        For two kinds of message, only a time in the future is proof of a fault:
+
+        * A room post. A room sends its backlog with the times when the members posted,
+          so an old time is correct.
+        * A message that waited in the companion (:attr:`waited`). It arrived at an
+          unknown time before :attr:`received_at`.
+
+        Args:
+            tolerance_s: The ``clock_tolerance_s`` preference.
+
+        Returns:
+            ``True`` when the screen must show the arrival time with the corrected mark.
+        """
+        offset = self.clock_offset_s
+        if offset is None:
+            return False
+        if self.waited or self.is_post:
+            return offset > tolerance_s
+        return abs(offset) > tolerance_s
+
+    def shown_at(self, tolerance_s: float) -> datetime:
+        """The time to show for this message: the sender time, or the arrival time if it is wrong.
+
+        Args:
+            tolerance_s: The ``clock_tolerance_s`` preference.
+
+        Returns:
+            :attr:`received_at` when :meth:`corrected` is true, else :attr:`created_at`.
+        """
+        if self.received_at is not None and self.corrected(tolerance_s):
+            return self.received_at
+        return self.created_at
 
     @property
     def key(self) -> str:
@@ -668,11 +885,13 @@ class ChatMessage:
             peer=None if message.is_channel else (message.sender or None),
             peer_name=peer_name,
             snr=message.snr,
-            # Use the timestamp of the sender (the moment when the message was composed)
-            # instead of ``received_at`` (when MeshTerm read it from the device). Thus the
-            # transcript shows the time of the message, not the time of the read. If the
-            # sender gave no timestamp, use the receive time.
+            # Keep the two times. The sender time (when the message was composed) is the
+            # time that the transcript shows, if the clock of the sender is correct. The
+            # arrival time is what MeshTerm knows for sure (refer to ``arrived_at``). If the
+            # sender gave no time, use the arrival time for both.
             created_at=message.sender_timestamp or message.received_at,
+            received_at=message.received_at,
+            waited=message.waited,
             author=None if message.is_channel else message.author,
         )
 

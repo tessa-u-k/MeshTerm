@@ -7,7 +7,11 @@ field, so "target" is only a UX concept. The two menu features divide on that li
 
 * **Trace target** (:func:`open_trace`) answers the question *can I reach this node?*
   The route is symmetric: the user composes (or explores) the outbound leg, and the
-  return leg is those hops in mirror order around the pinned target.
+  return leg is those hops in mirror order around the pinned target. A target that does
+  not relay (a companion, a room server, or a sensor, refer to
+  :func:`~meshterm.core.models.relays_traces`) stops a trace. Thus its walk turns at the
+  last relay of the route, and a line under the route names that relay. The route out of
+  such a walk is still the full route to the target, so the Device route row can offer it.
 * **Trace path** (:func:`open_trace_path`) answers the question *how far can a route
   that I build go?* It has no target. The user composes the full walk by hand, out and
   back by any way. The only condition is that the walk ends at a node that our node can
@@ -44,7 +48,17 @@ it to. An action list controls the screen: ↑/↓ select a row, and Enter runs 
   probe all of them: one measured trace for each candidate, stored as
   ``path_candidates`` rows and ranked by reliability first. Then MeshTerm offers the
   winner for adoption. The evidence proposes, the measurement decides, and the user
-  makes the choice.
+  makes the choice. When the user adopts a route, the highlight moves to Trace, the
+  same as after the composer.
+* **Device route** (Trace target only, for a contact that the radio has) says which route
+  the radio holds for the target, and opens the Device route popup of the node page
+  (refer to :mod:`~meshterm.ui.device_route_screen`). A trace that came home walked its
+  route out and back. Thus, when the route out of such a trace is not the radio's route,
+  the row turns green and offers it: ``Use this route for DMs and admin``. The popup then
+  has *Use the traced route* and *Use and keep it* first. Nothing interrupts the session:
+  only the row changes. A route that *Probe all* measured is already proved: when the user
+  adopts it, the probe traces become the first traces of the screen, so the row offers the
+  route at once, with no second transmission.
 * **Path width** opens a small dialog, where the user selects the path-hash width for
   each hop: 1, 2, or 4 bytes. A forced hop is addressed by this number of bytes from
   the start of its key. The first value is the routing width of the device. When the
@@ -57,8 +71,9 @@ it to. An action list controls the screen: ↑/↓ select a row, and Enter runs 
   nodes that send traffic in bursts. The tracing dialog counts the traces as the replies
   arrive.
 * **Trace** runs the selected number of traces. The highlight starts on this row, thus
-  Enter alone traces. While the traces are in progress, a floating *tracing* dialog
-  (spinner, progress, Abort) is over the screen. The replies go into the log behind
+  Enter alone traces. A path walk with no path has nothing to trace, so there the
+  highlight starts on Compose path. While the traces are in progress, a floating
+  *tracing* dialog (spinner, progress, Abort) is over the screen. The replies go into the log behind
   the dialog. Esc in the dialog cancels the run, but the screen stays open, and MeshTerm
   keeps the traces that it already stored. The screen adds each trace of the session to
   its medians. A walk can cross a link two times in the same direction. Before such a
@@ -105,17 +120,28 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from rich.cells import cell_len
 from rich.console import Group, RenderableType
 from rich.text import Text
 
-from ..core.models import PATH_TRACE_TARGET, HopAggregate, TraceResult, TraceStats
+from ..core.models import (
+    PATH_TRACE_TARGET,
+    HopAggregate,
+    TraceResult,
+    TraceStats,
+    relays_traces,
+    utcnow,
+)
 from ..services import trace_runner
 from ..services.records import first_repeated_edge
-from ..services.topology import render_forced_spec
+from ..services.topology import forced_outbound, render_forced_spec
+from ..services.trace_plan import plan_route, previous_outbound
 from .braillechart import meter
+from .device_route_screen import ICON as ROUTE_ICON
+from .device_route_screen import ProvenRoute, RouteRow
 from .menus import icon_lane, icon_mark, marked_label, section_heading
 from .pathline import (
     ELIDE_HEAD,
@@ -127,8 +153,10 @@ from .pathline import (
     hops_atom,
     path_line,
 )
+from .placemode import ACTION as PLACES_ACTION
+from .placemode import PlaceToggle, node_of, placed, places_of_session
 from .theme import snr_style
-from .tui.render import crop_cells, render_lines, render_to_ansi
+from .tui.render import crop_cells, render_hanging, render_lines, render_to_ansi
 from .tui.screen import Screen
 from .tui.spinner import Spinner, spinner_interval
 from .widgets import NodeResolver, highlighted_hash, link_text, route_path
@@ -204,7 +232,7 @@ _PATH_LANE = "path            "
 #: are one cell. Thus with a fixed ``"icon "`` prefix, the label of Explore starts one
 #: column to the right of the labels of all the other actions. Refer to
 #: :func:`_icon_lane`.
-_ACTION_ICONS = ("✎", "⇄", "⚡", "⚙", "#", "▶")
+_ACTION_ICONS = ("✎", "⇄", "⚡", ROUTE_ICON, "⚙", "#", "▶")
 
 
 def _icon_lane() -> int:
@@ -262,6 +290,12 @@ def _slid(line: Text, shift: int, width: int) -> Text:
     if right:
         out.append_text(cut_mark(line, shift + window - 1, ELIDE_TAIL))
     return out
+
+
+def _is_hash(hop: PathHop) -> bool:
+    """Whether a hop shows its hash and no name: place mode keeps such a hop as it is."""
+    key = (hop.key or "").lower().removeprefix("0x")
+    return hop.label.lower().removeprefix("0x") == key
 
 
 def _note(text: str, indent: int, *, style: str = "faint") -> Text:
@@ -429,14 +463,34 @@ class TraceScreen(Screen):
     screen was new.
 
     ↑/↓ move the highlight over the action rows, and Enter runs the selected row. The
-    highlight starts on Trace, so Enter alone traces. The results (the medians for each
-    hop and the trace log) come after the actions on the page. ↓ on the last action
+    highlight starts on Trace, so Enter alone traces. (A path walk with no path starts
+    on Compose path instead, because Trace cannot act there.) The results (the medians
+    for each hop and the trace log) come after the actions on the page. ↓ on the last action
     edge-scrolls into the results, and PgUp/PgDn/Home/End move the full screen. Esc
     leaves the screen and cancels a trace in progress. MeshTerm keeps the traces that it
     already stored.
     """
 
     floating = False
+
+    #: The hint sheds this atom first when it is too wide (refer to
+    #: :func:`~meshterm.ui.tui.frame.fit_hint`). The user finds the paging keys without
+    #: the hint, but nothing else shows ^N.
+    spare_hint_atoms = ("PgUp/PgDn scroll",)
+
+    @property
+    def picocalc_lyra_lane(self):
+        """The shared lane, with the place mode of the route lines on F1.
+
+        F1 is the ^N chip. It has a chip only while a route line is on the page that has
+        a named hop (refer to :meth:`_places_available`).
+        """
+        from .tui.fkeys import DEFAULT_LANE, FPair
+
+        lane = list(DEFAULT_LANE)
+        if self._places_available():
+            lane[0] = FPair(self._places.chip, PLACES_ACTION)
+        return lane
 
     def __init__(
         self,
@@ -460,6 +514,13 @@ class TraceScreen(Screen):
         auto_source: str = "",
         initial_spec: str = "",
         open_trophy_case: Callable[[], Awaitable[None]] | None = None,
+        route_row: RouteRow | None = None,
+        prove: Callable[[list[TraceResult]], ProvenRoute | None] | None = None,
+        seed_traces: Callable[[str], list[TraceResult]] | None = None,
+        relays: bool = True,
+        target_label: str | None = None,
+        neighbour: bool = False,
+        offer: ProvenRoute | None = None,
     ) -> None:
         """Create the screen (nothing transmits until the user runs Trace).
 
@@ -494,7 +555,8 @@ class TraceScreen(Screen):
                 rows and for the number of traces that one Trace action runs.
             explore: Opens the scenario browser and probe flow over this screen (target
                 mode only). Resolves to an adopted spec, or to ``None`` to keep the
-                current spec.
+                current spec. ``None`` leaves out the Explore row (a target that is known
+                by name only).
             pace_s: The cooldown that sleeps between the traces of a run with more than
                 one sample. Thus a sample session is never a burst for the repeaters.
             previous: The most recent stored trace, if one exists. Its route is the
@@ -517,6 +579,22 @@ class TraceScreen(Screen):
             open_trophy_case: Opens the trophy case over this screen. The left button
                 of the new-record dialog does this. ``None`` leaves only *Close* in the
                 dialog, which is what a screen that runs outside the menu gets.
+            route_row: The Device route row (target mode, for a contact that the radio
+                has), or ``None`` for no row.
+            prove: Finds the route out that the traces of the screen came home on, for
+                the Device route row. ``None`` offers no traced route.
+            seed_traces: Gives the traces that this session already walked on a spec (the
+                traces of a probe). When the screen adopts that spec, they become its
+                first traces. ``None`` starts each adopted path with no traces.
+            relays: Whether the target relays a trace (refer to
+                :func:`~meshterm.core.models.relays_traces`). ``False`` means that each walk
+                turns at the last relay before the target, and a line under the route says
+                so. With no relay to turn at, Trace has nothing to walk.
+            target_label: The name of the target, for that line. ``None`` uses ``target``.
+            neighbour: Whether MeshTerm hears the target directly. It changes the line
+                when a target that does not relay has no relay to turn at.
+            offer: A route for the Device route row to offer before any trace came home:
+                no relays, for a neighbour that does not relay. ``None`` offers nothing.
         """
         super().__init__()
         self.title = f"Trace — {target}" if mode == "target" else "Trace path"
@@ -540,6 +618,13 @@ class TraceScreen(Screen):
         self._auto_source = auto_source
         self._path_spec = initial_spec.strip()
         self._open_trophy_case = open_trophy_case
+        self._route_row = route_row if mode == "target" else None
+        self._prove = prove
+        self._seed_traces = seed_traces
+        self._relays = relays or mode != "target"
+        self._target_label = target_label or target
+        self._neighbour = neighbour
+        self._offer = offer
         #: The trophy case disciplines that the current run placed in. The key is the
         #: title of the discipline, so that a run with more than one sample that
         #: improves keeps only its latest ``"Title — score"`` label for each board.
@@ -578,11 +663,22 @@ class TraceScreen(Screen):
         # then Explore (target mode) or Reverse (path mode). Explore must have a
         # destination for which it ranks candidates, so path mode does not have it.
         # Only a path walk is asymmetric enough to turn end for end, so only path mode
-        # offers Reverse. The highlight starts on Trace in the two modes.
-        actions = ["compose", "explore"] if mode == "target" else ["compose", "reverse"]
+        # offers Reverse. The highlight starts on the first row that can act. Trace can
+        # act in target mode (with no path, the device routes), and in path mode when a
+        # path is available. A path walk with no path has nothing to trace, so there the
+        # highlight starts on Compose (GitHub #29: Enter then opens the composer).
+        # A target that is known by name only has no Explore (the session gives none).
+        actions = ["compose"]
+        if mode != "target":
+            actions.append("reverse")
+        elif explore is not None:
+            actions.append("explore")
+        if self._route_row is not None:
+            actions.append("route")
         actions += ["width", "samples", "trace"]
         self._actions: tuple[str, ...] = tuple(actions)
-        self._index = self._actions.index("trace")
+        ready = not self._needs_spec() or bool(self._effective_spec()[0])
+        self._index = self._actions.index("trace" if ready else "compose")
         self._pin_cursor = False  # pin the viewport only while ↑/↓ are in use
         #: How far ←→ slid the paths of the hops (in cells), and how far they can slide:
         #: the tail of the widest path, as the last paint measured it. It is 0 while the
@@ -590,6 +686,8 @@ class TraceScreen(Screen):
         #: the footer.
         self._hshift = 0
         self._hop_pan = 0
+        #: ^N: the route lines show the node names, or the places.
+        self._places = PlaceToggle()
 
     # --- state -----------------------------------------------------------------
 
@@ -602,7 +700,29 @@ class TraceScreen(Screen):
                 return f"tracing {done}/{total}… · PgUp/PgDn scroll · Esc back"
             return "tracing… · PgUp/PgDn scroll · Esc back"
         slide = " · ←→ scroll" if self._hop_pan else ""
-        return f"↑↓ actions{slide} · Enter run · PgUp/PgDn scroll · Esc back"
+        places = f" · {self._places.hint}" if self._places_available() else ""
+        return f"↑↓ actions{slide} · Enter run · PgUp/PgDn scroll{places} · Esc back"
+
+    def _places_available(self) -> bool:
+        """Whether ^N acts: the route lane shows a line with a named hop.
+
+        The hop lines of the results come from the walked route. Thus the route lane,
+        which draws the same hops, decides it for both.
+        """
+        current = next((t for t in reversed(self._traces) if t.success), None)
+        shown = self._shown_route(current)
+        if shown is None:
+            return False
+        return any(
+            hop.key and hop.label and not hop.you and not hop.gap and not _is_hash(hop)
+            for hop in shown[0].hops
+        )
+
+    def _placed(self, line: PathLine) -> PathLine:
+        """The path line with its places for the node names, while place mode is on."""
+        if self._places.on:
+            return placed(line, places_of_session(), node_of(self._resolve))
+        return line
 
     def start_trace(self) -> None:
         """Start a trace run in the background (does nothing while a run is in progress)."""
@@ -776,6 +896,9 @@ class TraceScreen(Screen):
             self._pin_cursor = False
             step = _HSCROLL_STEP if action == "right" else -_HSCROLL_STEP
             self._hshift = max(0, min(self._hop_pan, self._hshift + step))
+        elif action == PLACES_ACTION:
+            if self._places_available():
+                self._places.flip()
         elif action == "enter":
             self._commit_action()
         elif action == "up":
@@ -809,8 +932,9 @@ class TraceScreen(Screen):
         if key == "trace":
             # A path walk has nothing to transmit until a path is available (composed,
             # or the last stored walk). It has no target, so an empty spec cannot use
-            # device routing instead.
-            if self._mode == "path" and not self._effective_spec()[0]:
+            # device routing instead. A target that does not relay is the same: the walk
+            # must turn at a relay of the spec.
+            if self._needs_spec() and not self._effective_spec()[0]:
                 return
             edge = first_repeated_edge(self._spec_tokens())
             if edge is not None:
@@ -832,7 +956,86 @@ class TraceScreen(Screen):
         elif key == "reverse":
             self._reverse_path()
         elif key == "explore" and self._explore is not None:
-            self._open_flow(self._explore)
+            # The same as Compose: when the user adopts a route, the highlight moves to
+            # Trace, so Enter walks it (GitHub #29).
+            self._open_flow(self._explore, focus_trace=True)
+        elif key == "route":
+            self._open_route()
+
+    def proven(self) -> ProvenRoute | None:
+        """The route out that the traces of this route came home on, or ``None``.
+
+        Before the screen has traces, it is the route that the session offers at once (no
+        relays, for a neighbour that does not relay), while no spec gives a walk.
+        """
+        if self._prove is not None and self._traces:
+            return self._prove(self._traces)
+        if self._offer is not None and not self._effective_spec()[0]:
+            return self._offer
+        return None
+
+    def _needs_spec(self) -> bool:
+        """Whether Trace must have a spec to walk: no device routing can stand in for one.
+
+        A path walk has no target to route to. A target that does not relay has no turn
+        unless a spec gives a relay. In target mode, a target that relays can go without a
+        spec, because the device then routes the trace.
+        """
+        return self._mode == "path" or not self._relays
+
+    def _turn_note(self, current: TraceResult | None) -> str:
+        """The line under the route that says where the walk to a target that does not relay turns.
+
+        Such a target stops a trace, so each walk turns at the relay before it (refer to
+        :func:`~meshterm.core.models.relays_traces`). The line names that relay, from the
+        walk that the route lane shows. With no relay to turn at, the line says why: the
+        target is a neighbour, or MeshTerm knows no relay on the way to it.
+
+        Args:
+            current: The newest successful trace of this session, if one exists.
+
+        Returns:
+            The line, or ``""`` for a target that relays.
+        """
+        if self._relays:
+            return ""
+        name = self._target_label
+        if current is not None:
+            tokens = [h.node for h in current.hops if h.node]
+        else:
+            tokens = self._spec_tokens()
+            if not tokens and self._previous is not None and self._previous.success:
+                tokens = [h.node for h in self._previous.hops if h.node]
+        stops = f"{name} can't relay a trace"
+        if not tokens:
+            if self._neighbour:
+                return f"{stops}, and it's a direct neighbour: no relay to turn at"
+            return f"{stops}, and no relay on the way to it is known"
+        if len(tokens) % 2 and tokens == tokens[::-1]:
+            turn = tokens[len(tokens) // 2]
+            return f"{stops}, so the trace turns at {self._resolve(turn) or turn}"
+        return f"{stops}, so the trace turns before it"
+
+    def _open_route(self) -> None:
+        """Open the Device route popup over the screen, with the traced route to offer.
+
+        The popup changes no path of this screen: the route of the radio is a different
+        thing from the route that Trace walks. Thus the traces and the medians stay.
+        """
+        row = self._route_row
+        if row is None or self._dialog_open or self._running:
+            return
+        self._dialog_open = True
+        proven = self.proven()
+
+        async def run() -> None:
+            try:
+                await row.open(proven)
+            finally:
+                self._dialog_open = False
+                self._session.invalidate()
+
+        self._session.run_detached(run())
 
     def _open_flow(
         self, flow: PathFlow, seed: str | None = None, focus_trace: bool = False
@@ -854,9 +1057,9 @@ class TraceScreen(Screen):
                 becomes pinned, exactly as if the user adopted it by hand.
             focus_trace: Whether a confirmed flow (any resolution that is not
                 ``None``, also the unchanged spec) moves the highlight of the action
-                list to Trace. The composer uses this when it returns, so that Enter
-                walks the path that the user built. When the user leaves with Esc,
-                the highlight stays where it was.
+                list to Trace. The composer and the explorer use this when they return,
+                so that Enter walks the path that the user built or adopted. When the
+                user leaves with Esc, the highlight stays where it was.
         """
         if self._dialog_open or self._running:
             return
@@ -870,9 +1073,13 @@ class TraceScreen(Screen):
                 if spec is not None and spec.strip() != self._path_spec:
                     # A different spec is a different measurement. The aggregates, the
                     # medians for each hop, and the log all belong to the old route.
-                    # Thus the session starts again, as clean as a new screen.
+                    # Thus the session starts again, as clean as a new screen. Only the
+                    # traces that this session already walked on the new spec (a probe)
+                    # stay, because they measured exactly this route.
                     self._path_spec = spec.strip()
                     self._traces.clear()
+                    if self._seed_traces is not None:
+                        self._traces.extend(self._seed_traces(self._path_spec))
                     self._traces_rev += 1
                     self._status = ""
             finally:
@@ -932,6 +1139,14 @@ class TraceScreen(Screen):
         # zero. It never separates a name from its hash, and never breaks a wire spec
         # in the middle of a hash.
         lines = _lane_lines(_ROUTE_LANE, self._route_value(current, width), width)
+        turn = self._turn_note(current)
+        if turn:
+            # The line is a sentence that can be long, so it wraps under the column of the
+            # lane, and is not cropped as the route lines are.
+            indent = len(_ROUTE_LANE)
+            lines.extend(
+                render_hanging(Text(" " * indent), Text(turn, style="muted"), width, indent=indent)
+            )
         lines.extend(render_lines(Group(Text(), self._summary(stats)), width))
         lines.extend(_lane_lines(_PATH_LANE, self._path_value(current, width), width))
         lines.append("")
@@ -944,10 +1159,10 @@ class TraceScreen(Screen):
             if selected:
                 self._cursor = len(lines)
             lines.append(render_to_ansi(text, width))
-            # Put a gap before the next group: after the build-path group (Explore in
-            # target mode, Reverse in path mode, whichever is last) and after the
-            # trace-settings group.
-            if key in ("explore", "reverse", "samples"):
+            # Put a gap before the next group: after the build-path group (its last row
+            # is the row before Width) and after the trace-settings group.
+            closes = self._actions[self._actions.index("width") - 1]
+            if key in (closes, "samples"):
                 lines.append("")
         # The results are page, not a list window of their own. Nothing highlights them.
         # Thus a private list window hides its rows from the arrows, and gives the frame
@@ -966,7 +1181,7 @@ class TraceScreen(Screen):
         it changes. A *running* trace does not use the cache at all, because its log row
         has the live spinner glyph.
         """
-        key = (self._traces_rev, self._status, width, self._hshift)
+        key = (self._traces_rev, self._status, width, self._hshift, self._places.on)
         if not self._running and self._tail_memo is not None and self._tail_memo[0] == key:
             return self._tail_memo[1]
         lines: list[str] = []
@@ -983,7 +1198,10 @@ class TraceScreen(Screen):
         if not self._running:
             # The key is the shift at which the rows were drawn, which _hop_lines can
             # clamp. Thus the next paint finds it.
-            self._tail_memo = ((self._traces_rev, self._status, width, self._hshift), lines)
+            self._tail_memo = (
+                (self._traces_rev, self._status, width, self._hshift, self._places.on),
+                lines,
+            )
         return lines
 
     def cursor_line(self) -> int | None:
@@ -1011,6 +1229,10 @@ class TraceScreen(Screen):
         elif key == "explore":
             _icon(text, "⚡", "warn")
             text.append("Explore paths")
+        elif key == "route" and self._route_row is not None:
+            label, lit = self._route_row.text(self.proven())
+            _icon(text, ROUTE_ICON, "ok" if lit else "accent")
+            text.append(label, style="ok" if lit else "")
         elif key == "width":
             w = self._width_bytes()
             _icon(text, "⚙", "accent")
@@ -1019,10 +1241,12 @@ class TraceScreen(Screen):
             n = self._sample_count()
             _icon(text, "#", "accent")
             text.append(f"Sample count — {n} trace{'s' if n != 1 else ''}")
-        else:  # trace: the row on which the highlight starts
+        else:  # trace: the row on which the highlight starts, when a path is available
             _icon(text, "▶", "ok")
             if self._mode == "path" and not self._effective_spec()[0]:
                 text.append("Trace — compose a path first", style="muted")
+            elif self._needs_spec() and not self._effective_spec()[0]:
+                text.append("Trace — no relay to turn at", style="muted")
             else:
                 n = self._sample_count()
                 if n > 1:
@@ -1060,38 +1284,47 @@ class TraceScreen(Screen):
             continuations already have the indent of the lane.
         """
         indent = len(_ROUTE_LANE)
-        if current is not None:
-            route = route_path(
-                current,
-                self._device_label,
-                self._resolve,
-                self._device_hash,
-                bare_self=True,
-                show_hash=False,
-            )
-            return route.wrapped(width, indent=indent)
-        planned = self._planned_route()
-        if planned is not None:
-            lines = planned.wrapped(width, indent=indent)
-            if self._effective_spec()[1] and self._auto_source:
-                lines.append(_note(f"(auto · {self._auto_source})", indent))
-            return lines
-        if self._previous is not None:
-            route = route_path(
-                self._previous,
-                self._device_label,
-                self._resolve,
-                self._device_hash,
-                bare_self=True,
-                show_hash=False,
-            )
-            lines = route.wrapped(width, indent=indent)
-            stamp = self._previous.timestamp.astimezone().strftime("%b %d %H:%M")
-            lines.append(_note(f"(previous · {stamp})", indent))
+        shown = self._shown_route(current)
+        if shown is not None:
+            route, note = shown
+            lines = self._placed(route).wrapped(width, indent=indent)
+            if note:
+                lines.append(_note(note, indent))
             return lines
         if self._mode == "path":
             return [Text("none — compose a path to walk", style="muted")]
+        if not self._relays:
+            return [Text("none — no relay to turn at", style="muted")]
         return [Text("unknown — press Enter to trace", style="muted")]
+
+    def _shown_route(self, current: TraceResult | None) -> tuple[PathLine, str] | None:
+        """The path line of the route lane, and the note under it (``""`` for none).
+
+        The order is the order that :meth:`_route_value` explains: the live route, the
+        planned route, the previous route. The result is ``None`` when there is no route to
+        show. The line is not changed by place mode (refer to :meth:`_placed`).
+        """
+        if current is not None:
+            return self._walked_route(current), ""
+        planned = self._planned_route()
+        if planned is not None:
+            auto = self._effective_spec()[1] and self._auto_source
+            return planned, f"(auto · {self._auto_source})" if auto else ""
+        if self._previous is not None:
+            stamp = self._previous.timestamp.astimezone().strftime("%b %d %H:%M")
+            return self._walked_route(self._previous), f"(previous · {stamp})"
+        return None
+
+    def _walked_route(self, result: TraceResult) -> PathLine:
+        """The route that a trace walked, with bare ends and no hashes after the names."""
+        return route_path(
+            result,
+            self._device_label,
+            self._resolve,
+            self._device_hash,
+            bare_self=True,
+            show_hash=False,
+        )
 
     def _effective_spec(self) -> tuple[str, bool]:
         """The wire spec that the next Trace walks, and whether automatic resolution gave it.
@@ -1361,15 +1594,17 @@ class TraceScreen(Screen):
             None if not node or node == self._device_label else node
             for node in (agg.origin, agg.destination)
         ]
-        return path_line(
-            ends,
-            self._resolve,
-            prefix_bytes=hash_bytes or 8,
-            self_name=self._device_label,
-            hash_bytes=hash_bytes,
-            bare_self=True,
-            from_origin=from_origin,
-            to_destination=to_destination,
+        return self._placed(
+            path_line(
+                ends,
+                self._resolve,
+                prefix_bytes=hash_bytes or 8,
+                self_name=self._device_label,
+                hash_bytes=hash_bytes,
+                bare_self=True,
+                from_origin=from_origin,
+                to_destination=to_destination,
+            )
         ).text()
 
     def _trace_log(self) -> RenderableType:
@@ -1427,36 +1662,6 @@ def collapse_trace_width(mode: int) -> int:
     return max(s for s in (1, 2, 4, 8) if s <= size)
 
 
-def _previous_outbound(previous: TraceResult | None, target_hash: str) -> tuple[str, ...] | None:
-    """Extract the outbound repeaters from the last successful walk to a target.
-
-    A trace in target mode walks the symmetric boomerang. Thus its stored hop hashes
-    (the last hop, with no hash, is our node) are ``[out…, target, out reversed…]``:
-    a palindrome of odd length whose middle entry is the target. When the stored walk
-    has that shape, its first half is a route that the mesh already proved, ready to
-    force again.
-
-    Args:
-        previous: The most recent successful stored trace, if one exists.
-        target_hash: The full hex hash of the target, to make sure that the walk
-            turned at this target (the hop hashes are prefixes of it).
-
-    Returns:
-        The outbound repeater hashes in order, from our node outward (empty = the
-        target answered directly). ``None`` when there is no stored walk, or when it
-        is not a boomerang that this function can recognize.
-    """
-    if previous is None or not previous.success:
-        return None
-    tokens = [h.node.lower() for h in previous.hops if h.node]
-    if not tokens or len(tokens) % 2 == 0 or tokens != tokens[::-1]:
-        return None
-    mid = len(tokens) // 2
-    if not target_hash.lower().startswith(tokens[mid]):
-        return None
-    return tuple(tokens[:mid])
-
-
 def _previous_walk(previous: TraceResult | None) -> tuple[str, ...] | None:
     """Extract the full walked route from the last successful stored path walk.
 
@@ -1478,35 +1683,6 @@ def _previous_walk(previous: TraceResult | None) -> tuple[str, ...] | None:
         return None
     tokens = tuple(h.node.lower() for h in previous.hops if h.node)
     return tokens or None
-
-
-def _best_observed(topo: Any, target_hash: str) -> tuple[tuple[str, ...], str] | None:
-    """The strongest outbound route to ``target_hash`` in the evidence, if the data has one.
-
-    This is the observed-topology counterpart of the route that the firmware learned.
-    The device often knows no route to a contact, because repeater contacts flood. In
-    that case, the evidence of the recorder (traces, relay chains heard from other
-    traffic, neighbour tables that MeshTerm got) may still give a route for which there
-    is proof that it carried traffic. The ranking is done by
-    :meth:`~meshterm.services.topology.MeshTopology.suggested`. This function returns
-    the canonical outbound hops of the winner, with a short source line
-    (``best observed · 3× · −7 dB``) for the route line and the summary. It returns
-    ``None`` when no route is better than a direct attempt.
-
-    Args:
-        topo: The newly built :class:`~meshterm.services.topology.MeshTopology`.
-        target_hash: The hex hash of the target (any width ≥ 1 byte).
-
-    Returns:
-        ``(outbound_hops, provenance)`` for the suggested route, or ``None``.
-    """
-    scenario = topo.suggested(topo.canonical(target_hash) or target_hash[:12])
-    if scenario is None:
-        return None
-    source = f"best observed · {scenario.samples}×"
-    if scenario.weakest_snr is not None:
-        source += f" · {scenario.weakest_snr:+.0f} dB"
-    return scenario.hops, source
 
 
 def _scenario_path(
@@ -1562,7 +1738,9 @@ def _scenario_detail(scenario: Any) -> Text:
     ``unobserved`` when the evidence graph has no information about the route yet.
     """
     atoms: list[Text] = [hops_atom(len(scenario.hops))]
-    if scenario.source == "device":
+    if scenario.source in ("device", "outbound"):
+        # An outbound route is a claim about where its first hops came from, the same as
+        # the device route: the user named them (refer to MeshTopology.outbound_scenarios).
         atoms.append(Text(scenario.label, style="accent"))
     if scenario.weakest_snr is not None:
         snr = Text("weakest ", style="muted")
@@ -1580,7 +1758,14 @@ def _scenario_detail(scenario: Any) -> Text:
     return detail
 
 
-async def open_trace(ctx: AppContext, target: str, *, initial_spec: str = "") -> int:
+async def open_trace(
+    ctx: AppContext,
+    target: str,
+    *,
+    initial_spec: str = "",
+    label: str | None = None,
+    node_type: int | None = None,
+) -> int:
     """Open the live *Trace target* screen for ``target``, and run it until the user leaves.
 
     This is the symmetric feature: can I reach this node? Routes turn at the target and
@@ -1596,6 +1781,12 @@ async def open_trace(ctx: AppContext, target: str, *, initial_spec: str = "") ->
             suggested best path, so that the trace opens ready to walk that path. Empty
             (the default) opens on the automatic route (learned by the device, best
             observed, last trace, or direct, refer to :func:`_open_session`).
+        label: The name that the screen shows for a target that is not a contact (the
+            Message paths dialog gives the name of the sender with its key). ``None``
+            shows the target as given. A contact always shows its own name.
+        node_type: The type of the target, when the caller knows it and MeshTerm possibly
+            has no stored type (the sender of channel text is a companion). The type of a
+            contact, or of the last advert of the node, comes first.
 
     Returns:
         The number of traces that ran while the screen was open.
@@ -1603,7 +1794,9 @@ async def open_trace(ctx: AppContext, target: str, *, initial_spec: str = "") ->
     Raises:
         RuntimeError: If called outside the interactive menu (no full-screen session).
     """
-    return await _open_session(ctx, target, initial_spec=initial_spec)
+    return await _open_session(
+        ctx, target, initial_spec=initial_spec, label=label, node_type=node_type
+    )
 
 
 async def open_trace_path(ctx: AppContext, spec: str = "") -> int:
@@ -1631,7 +1824,14 @@ async def open_trace_path(ctx: AppContext, spec: str = "") -> int:
     return await _open_session(ctx, None, initial_spec=spec)
 
 
-async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: str = "") -> int:
+async def _open_session(
+    ctx: AppContext,
+    target: str | None,
+    *,
+    initial_spec: str = "",
+    label: str | None = None,
+    node_type: int | None = None,
+) -> int:
     """Connect and run one live trace session (the two features share this code).
 
     This function connects the screen to the radio, the database, and the
@@ -1652,8 +1852,14 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             a path walk with no target.
         initial_spec: A forced path (hex hops separated by commas) on which the path
             screen opens armed, instead of idle on the history. *Trace this path* in the
-            trophy case gives it. Ignored in target mode (only path walks arm on a bare
-            spec).
+            trophy case gives it. In target mode, it arms only when the target can be
+            addressed (a contact or a hex key), because a forced path must turn at a real
+            hash, or when the target does not relay, because then the walk turns at the
+            last relay. The Node detail screen and the Message paths dialog give it there.
+        label: The name to show for a target that is not a contact. ``None`` shows the
+            target as given.
+        node_type: The type of the target, for a target with no stored type (refer to
+            :func:`open_trace`).
 
     Returns:
         The number of traces that ran while the screen was open.
@@ -1670,6 +1876,7 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
     )
     from ..services.path_probe import ProbeCandidate, ProbeOutcome, probe_paths
     from ..services.topology import MeshTopology, build_topology, collapse_width, is_path_hash
+    from .admin_login import ask_password, no_reply_text, offer_new_password, refused_text
     from .path_composer import FetchNeighbours, PathComposerScreen
     from .surface import TuiUi
     from .tui import CANCEL, Choice, SelectScreen, Separator
@@ -1711,8 +1918,9 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
     # The target as a hash that can be addressed: the full key of a known contact, or
     # the typed hex prefix. An unknown target that is not hex can still be traced with
     # device routing. But to compose or explore, a destination hash is necessary on
-    # which to pin the path. A path walk has no target: each target_* stays None, and
-    # the composer runs with a route by hand.
+    # which to pin the path, except for a target that does not relay (refer to by_name
+    # below). A path walk has no target: each target_* stays None, and the composer runs
+    # with a route by hand.
     target_contact: Contact | None = None
     target_hash: str | None = None
     target_label: str | None = None
@@ -1733,7 +1941,22 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             .removeprefix("0x")
         )
         target_hash = raw_hash if is_path_hash(raw_hash) else None
-        target_label = target_contact.name if target_contact else target
+        target_label = target_contact.name if target_contact else (label or target)
+
+    # Whether the target relays a trace (refer to relays_traces). A contact gives its type.
+    # A node that is not a contact (the sender of a message, opened from Message paths)
+    # gives the type of its last advert that MeshTerm heard, or else the type that the
+    # caller knows. A node with no known type is traced itself, as before.
+    target_type = target_contact.node_type if target_contact is not None else None
+    if target_type is None and target_hash is not None and target_contact is None:
+        target_type = ctx.repo.node_type(target_hash[:12])
+    if target_type is None:
+        target_type = node_type
+    target_relays = mode == "path" or relays_traces(target_type)
+    # A target with no hash that does not relay (the sender of a channel message with no
+    # known key): each walk to it turns at the last relay, so no walk has to address it.
+    # Only the evidence of its route is not there, because the graph keeps nodes by key.
+    by_name = mode == "target" and target_hash is None and not target_relays
 
     def fresh_topology() -> MeshTopology:
         """Build the evidence graph from all the data that is stored now and on the device."""
@@ -1748,42 +1971,37 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
     previous = ctx.repo.latest_trace(record_target)
 
     # What an *auto* trace (with no composed path) forces on the air, and where that
-    # route came from. A trace replies only when its destination is the last outbound
-    # hop of the path and nothing reflects it back home. Thus auto must always give a
-    # full boomerang. But the device rarely has one to give. The firmware learns the
-    # ``out_path`` of a contact only from addressed traffic in the two directions
-    # (checked on hardware: each repeater contact reported ``out_path_len`` -1,
-    # flood). Thus a trace with device routing to a node farther than a direct
-    # neighbour goes out with no repeaters, and fails. The order of priority: the route
-    # that the device learned, when it really has one. If not, the outbound leg of the
-    # last successful stored walk (the route that the screen shows). If not, the bare
-    # destination: a direct attempt, which says clearly that it is one.
+    # route came from. A trace comes back only on a full boomerang, which the device
+    # rarely has to give (refer to meshterm.services.trace_plan, which the CLI uses too).
+    # To make hop hashes canonical, only the contact index is necessary. Thus an *empty*
+    # graph does it. The full evidence build of fresh_topology() (stored traces, packet
+    # paths, neighbour tables) is necessary only for a suggestion from the evidence.
+    ident = MeshTopology(device_hash or "local", contacts)
+    store = getattr(ctx, "outbound_store", None)
+    choice = store.lookup(device_hash) if store is not None else None
+    outbound = (
+        tuple(tuple(ident.canonical(h) or h for h in path) for path in choice.paths)
+        if choice is not None
+        else ()
+    )
+    silent_before = utcnow() - timedelta(hours=ctx.preferences.outbound_silent_hours)
     device_route: tuple[str, ...] | None = None
     if target_contact is not None and target_contact.route_hops is not None:
-        # To make hop hashes canonical, only the contact index is necessary. Thus an
-        # *empty* graph does it. The full evidence build of fresh_topology() (stored
-        # traces, packet paths, neighbour tables) is not necessary, because this
-        # branch does not read it.
-        ident = MeshTopology(device_hash or "local", contacts)
         device_route = tuple(ident.canonical(h) or h for h in target_contact.route_hops)
     auto_hops: tuple[str, ...] | None = None
     auto_source = ""
     if target_hash is not None:
-        if device_route is not None:
-            auto_hops, auto_source = device_route, "device route"
-        elif (observed := _best_observed(fresh_topology(), target_hash)) is not None:
-            # The firmware has no route, but the evidence of the recorder gives one: the
-            # strongest observed path (the ranking uses sample counts and SNR). Because
-            # of this, Trace target *suggests* a route from the data. It does not use a
-            # flood with no path by default, which fails after the first neighbour.
-            auto_hops, auto_source = observed
-        else:
-            auto_hops = _previous_outbound(previous, target_hash)
-            if auto_hops is not None and previous is not None:
-                stamp = previous.timestamp.astimezone().strftime("%b %d %H:%M")
-                auto_source = f"last trace · {stamp}"
-            else:
-                auto_hops, auto_source = (), "direct — no known route"
+        plan = plan_route(
+            target_hash,
+            topology=fresh_topology,
+            device_route=device_route,
+            outbound=outbound,
+            choice=choice,
+            silent_before=silent_before,
+            previous=previous,
+            relays=target_relays,
+        )
+        auto_hops, auto_source = plan.hops, plan.source
     elif mode == "path":
         auto_hops = _previous_walk(previous)
         if auto_hops is not None and previous is not None:
@@ -1800,7 +2018,20 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             return ""
         if target_hash is None:
             return ",".join(auto_hops)
-        return render_forced_spec(auto_hops, target_hash, width_bytes)
+        return render_forced_spec(auto_hops, target_hash, width_bytes, relays=target_relays)
+
+    # A caller (the node page, Message paths) gives a route as the forced spec that turns
+    # at the target. When the target does not relay, the trace stops there. Thus the spec
+    # turns at the last relay of the same route instead, and the callers do not have to
+    # know the rule. With no relay, nothing is left to walk, and the screen opens on the
+    # automatic route.
+    if mode == "target" and target_hash is not None and not target_relays and initial_spec:
+        tokens = [t.strip() for t in initial_spec.split(",") if t.strip()]
+        route = forced_outbound(tokens, target_hash)
+        if route is not None:
+            initial_spec = render_forced_spec(
+                route, target_hash, max(1, len(tokens[0]) // 2), relays=False
+            )
 
     async def unaddressable() -> None:
         """Explain why the path features of target mode must have a target that resolves."""
@@ -1812,7 +2043,9 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             title="No destination hash",
         )
 
-    async def fetch_neighbours_via(repeater: Contact, repeater_id: str) -> bool:
+    async def fetch_neighbours_via(
+        repeater: Contact, repeater_id: str, *, ask: bool = False
+    ) -> bool:
         """Log in to a repeater, get its neighbour table, and store the snapshot.
 
         The fetch action of the composer comes here. The password comes from the admin
@@ -1821,20 +2054,28 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         spinner dialog with Abort. Each outcome closes its own ``runs`` row. A refused
         login also forgets the stored password, so the next attempt asks again.
 
+        A stock repeater does not answer a wrong password. Thus, when a stored password
+        gets no reply, the function offers a new password, as the shared login of the menu
+        does (refer to :mod:`meshterm.ui.admin_login`). If the user accepts, the function
+        runs again with ``ask``.
+
         Args:
             repeater: The repeater contact to query (it has the public key).
             repeater_id: Its canonical id, the key under which the snapshot is stored.
+            ask: Ask for a password, also when one is stored. The stored password stays
+                until the typed one works.
 
         Returns:
             ``True`` when new neighbour links were stored (the caller must build the
             topology again). ``False`` on a cancel, a failure, or an empty table.
         """
-        password = ctx.admin_store.get(repeater)
+        password = None if ask else ctx.admin_store.get(repeater)
+        saved = password is not None
+        # Set when a stored password got no reply: then a new password is offered.
+        stale = False
         if password is None:
-            password = await session.text(
-                f"Admin password for {repeater.name}",
-                prompt="The repeater ignores neighbour requests without an admin login.",
-                password=True,
+            password = await ask_password(
+                ctx, repeater, why="The repeater ignores neighbour requests without an admin login."
             )
             if not password:
                 return False
@@ -1851,18 +2092,14 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         dialog.status = f"logging in to {repeater.name}…"
 
         async def work() -> list[NeighbourInfo]:
+            nonlocal stale
             outcome = await device.admin_login(repeater, password)
             ctx.admin_store.record(repeater, password, outcome)
             if outcome is LoginResult.REFUSED:
-                raise DeviceAuthenticationError(
-                    f"{repeater.name!r} rejected the admin login (wrong password?). "
-                    "The saved password was cleared; retry to enter a new one."
-                )
+                raise DeviceAuthenticationError(refused_text(repeater, saved=saved, again="retry"))
             if not outcome:
-                raise DeviceCommandError(
-                    f"No reply from {repeater.name} — it may be out of reach, asleep, or "
-                    "busy. The saved password was kept; retry when it answers."
-                )
+                stale = saved
+                raise DeviceCommandError(no_reply_text(repeater, again="retry"))
             dialog.status = "fetching the neighbour table…"
             session.invalidate()
             return await device.fetch_neighbours(repeater)
@@ -1904,6 +2141,10 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             # ``work`` and AdminStore.record). Thus an exception here is only a message
             # to show.
             ctx.repo.finish_run(run_id, "error", {"error": str(error) or type(error).__name__})
+            if stale:
+                if await offer_new_password(ctx, repeater):
+                    return await fetch_neighbours_via(repeater, repeater_id, ask=True)
+                return False
             await session.message_dialog(Text(str(error), style="err"), title="Fetch neighbours")
             return False
         ctx.repo.record_neighbours(run_id, repeater_id, entries)
@@ -1930,7 +2171,7 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         composer again exactly where the user was (the same hops and insertion slot,
         with refreshed suggestions).
         """
-        if mode == "target" and target_hash is None:
+        if mode == "target" and target_hash is None and not by_name:
             await unaddressable()
             return None
         topo = fresh_topology()
@@ -1948,7 +2189,9 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         if mode == "path":
             seed = ids
         elif ids and len(ids) % 2 == 1 and ids == ids[::-1]:
-            seed = ids[: len(ids) // 2]
+            # A target that does not relay is not in its walk: the middle hop is the last
+            # relay of the route, and the user composes the route up to and with it.
+            seed = ids[: len(ids) // 2 + (0 if target_relays else 1)]
         elif target_id in ids:
             seed = ids[: ids.index(target_id)]  # an old walk by hand: keep the outbound
         else:
@@ -1972,10 +2215,12 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
                 target_id=target_id,
                 target_hash=target_hash,
                 target_label=target_label,
+                target_relays=target_relays,
                 hops=seed,
                 cursor=seed_cursor,
                 fetch_nodes=frozenset(fetchable),
                 resolve=resolve,  # name a hop that the topology left ambiguous, as we do
+                outbound_paths=outbound,  # the user's ways out lead the first slot
             )
             result = await session.run_screen(screen)
             if result is CANCEL:
@@ -2099,6 +2344,10 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         text.append(f"  ({outcome.candidate.label})", style="faint")
         return text
 
+    #: The traces that each probe walked, by spec, for the screen to start an adopted route
+    #: with (refer to the seed_traces argument of TraceScreen).
+    probe_traces: dict[str, list[TraceResult]] = {}
+
     async def run_probe(
         candidates: list[ProbeCandidate],
     ) -> list[ProbeOutcome] | None:
@@ -2123,6 +2372,9 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         dialog.status = f"path 1/{len(candidates)} · one trace each"
 
         def on_result(index: int, done: int, result: TraceResult) -> None:
+            # Keep the trace for its spec. When the user adopts that route, the screen
+            # starts with it (refer to seed_traces), and needs no second transmission.
+            probe_traces.setdefault(candidates[index].spec.strip(), []).append(result)
             dialog.status = f"path {index + 1}/{len(candidates)} · one trace each"
             dialog.last = result
             session.invalidate()
@@ -2205,12 +2457,21 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             return None
         topo = fresh_topology()
         target_id = topo.canonical(target_hash) or target_hash[:12]
-        scenarios = topo.scenarios(target_id, device_route=device_route)
+        scenarios = topo.scenarios(
+            target_id, device_route=device_route, outbound=outbound, silent_before=silent_before
+        )
+        if not target_relays:
+            # A walk to a target that does not relay turns at the last relay of the route.
+            # A route with no relay has no turn, so no trace can walk it.
+            scenarios = [s for s in scenarios if s.hops]
         if not scenarios:
             await session.message_dialog(
                 Text(
                     "no observed evidence involving this target yet — run a trace or "
-                    "let monitoring accumulate paths first.",
+                    "let monitoring accumulate paths first."
+                    if target_relays
+                    else f"{target_label} can't relay a trace, and no relay on the way to "
+                    "it has been heard yet — let monitoring accumulate paths first.",
                     style="muted",
                 ),
                 title="Explore paths",
@@ -2252,7 +2513,9 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             SelectScreen(
                 f"Explore paths — {target_label}",
                 items,
-                prompt="Choose the outbound leg — the return mirrors it.",
+                prompt="Choose the outbound leg — the return mirrors it."
+                if target_relays
+                else "Choose the route — the trace turns at its last relay.",
                 footer_hint="↑↓ move · Enter adopt/probe · Esc back",
                 hscroll=True,  # a long candidate row slides under ←→, and is not truncated
             )
@@ -2260,14 +2523,14 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         if picked is CANCEL or picked is None:  # Esc
             return None
         if picked[0] == "use":
-            return picked[1].spec(target_hash, width_bytes)
+            return picked[1].spec(target_hash, width_bytes, relays=target_relays)
 
         # Probe all: measure each different spec. (Scenarios can collapse to the same
         # spec after they are truncated to the trace width, and the radio must not walk
         # one spec two times.)
         candidates: list[ProbeCandidate] = []
         for scenario in scenarios:
-            spec = scenario.spec(target_hash, width_bytes)
+            spec = scenario.spec(target_hash, width_bytes, relays=target_relays)
             if all(c.spec != spec for c in candidates):
                 candidates.append(ProbeCandidate(label=scenario.label, spec=spec))
         outcomes = await run_probe(candidates)
@@ -2413,6 +2676,80 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
             },
         )
 
+    # The Device route row: only for a target that the radio has as a contact, because the
+    # radio holds a route only for its own contacts (refer to device_route_screen).
+    route_row: RouteRow | None = None
+    prove = None
+    target_key = (target_contact.public_key if target_contact else "").lower()
+    if mode == "target" and target_contact is not None and len(target_key) == 64:
+        from .device_route_screen import RouteEnv
+
+        def build_route_env(current: Contact) -> RouteEnv:
+            """What the popup needs, from all the evidence that is stored now."""
+            topo = fresh_topology()
+            canonical = topo.canonical(target_key) or target_key[:12]
+            radio = (
+                tuple(topo.canonical(h) or h for h in current.route_hops)
+                if current.route_hops is not None
+                else None
+            )
+            return RouteEnv(
+                contact=current,
+                label=target_label or current.name,
+                target=canonical,
+                topology=topo,
+                self_key=(device_hash or "").lower(),
+                width_bytes=width_bytes,
+                resolve=resolve,
+                scenarios=topo.scenarios(
+                    canonical, device_route=radio, outbound=outbound, silent_before=silent_before
+                ),
+                suggested=topo.suggested(canonical, outbound=outbound, silent_before=silent_before),
+                outbound=outbound,
+            )
+
+        def prove(traces: list[TraceResult]) -> ProvenRoute | None:
+            """The route out of the newest trace that came home, with the proof of the run.
+
+            A walk to a target that does not relay turned at the last relay of the route.
+            Thus its route is the hops up to and with that relay, which is a route that the
+            radio can send to the target on.
+            """
+            home = [t for t in traces if t.success]
+            if not home:
+                return None
+            hops = previous_outbound(home[-1], target_key, relays=target_relays)
+            if hops is None:
+                return None
+            stats = TraceStats.from_traces(record_target, traces)
+            return ProvenRoute(
+                hops=tuple(ident.canonical(h) or h for h in hops),
+                home=len(home),
+                sent=len(traces),
+                worst_snr=stats.median_min_snr,
+            )
+
+        route_row = RouteRow(
+            ctx,
+            target_contact,
+            device_key=(device_hash or "").lower(),
+            build_env=build_route_env,
+        )
+
+    # A target that does not relay, with no relay on its route, gives the walk no place to
+    # turn. The screen says why (refer to TraceScreen._turn_note). A node that MeshTerm
+    # hears directly is a neighbour: the radio's route to it is no relays, and the Device
+    # route row offers that route at once, with no trace to prove it.
+    neighbour = False
+    offer: ProvenRoute | None = None
+    if mode == "target" and target_hash is not None and not target_relays and not auto_hops:
+        topo = fresh_topology()
+        link = topo.link(topo.self_id, topo.canonical(target_hash) or target_hash[:12])
+        heard = link.samples if link is not None else 0
+        neighbour = heard > 0 or device_route == ()
+        if heard and route_row is not None:
+            offer = ProvenRoute(hops=(), home=0, sent=0, heard=heard)
+
     screen = TraceScreen(
         record_target,
         mode=mode,
@@ -2422,7 +2759,9 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         session=session,
         trace=trace_once,
         compose_path=compose,
-        explore=explore if mode == "target" else None,
+        # Explore ranks the routes to a node in the graph, which keeps nodes by key. Thus a
+        # target that is known by name only has no Explore row.
+        explore=explore if mode == "target" and not by_name else None,
         pick_width=pick_width,
         pick_samples=pick_samples,
         width_bytes=lambda: width_bytes,
@@ -2434,9 +2773,18 @@ async def _open_session(ctx: AppContext, target: str | None, *, initial_spec: st
         # A spec from the caller arms the two modes: the stored route of a path walk, or
         # the suggested best path that the Node detail screen gives to a target trace. In
         # target mode, it arms only when the target can be addressed, because a forced
-        # path must end at a real hash.
-        initial_spec=initial_spec if (mode == "path" or target_hash is not None) else "",
+        # path must end at a real hash, or when the walk turns before the target.
+        initial_spec=(
+            initial_spec if (mode == "path" or target_hash is not None or by_name) else ""
+        ),
         open_trophy_case=_trophy_case_opener(ctx),
+        route_row=route_row,
+        prove=prove,
+        seed_traces=lambda spec: list(probe_traces.get(spec, [])),
+        relays=target_relays,
+        target_label=target_label,
+        neighbour=neighbour,
+        offer=offer,
     )
     try:
         await session.run_screen(screen)

@@ -325,54 +325,21 @@ async def open_repeater_admin(ctx: AppContext) -> dict[str, Any] | None:
 async def _login(ctx: AppContext, device: Device, node: Contact) -> bool:
     """Log in to ``node``: with a remembered password silently, or else one floating prompt.
 
-    MeshTerm remembers a password that works. It forgets a rejected password, so that the
-    next try asks for a new one (the convention for remote admin in all the app). But it
-    forgets only a rejected password. A node that never answered said nothing about the
-    password, so when there is no answer, MeshTerm keeps the password. Before, if the user
-    administered a repeater that was down at that time, MeshTerm erased its credential.
+    The flow is the shared admin login of the menu (refer to
+    :func:`~meshterm.ui.admin_login.log_in`). MeshTerm remembers a password that works and
+    forgets a refused one. A node that never answered said nothing about the password, so
+    MeshTerm keeps the password and offers to replace it. Before, if the user administered
+    a repeater that was down at that time, MeshTerm erased its credential.
     """
-    from ..core.models import LoginResult
+    from .admin_login import log_in
 
-    session = ctx.ui.session
-    password = ctx.admin_store.get(node)
-    prompted = password is None
-    if password is None:
-        password = await session.text(
-            f"Admin password for {node.name}",
-            prompt="The node ignores admin commands without a login.",
-            password=True,
-            # The picker dialog is closed now, so this prompt is the only screen on the stack.
-            # The flag keeps it a box over a blank base, not a full-frame prompt.
-            floating=True,
-        )
-        if not password:
-            return False
-    async with ctx.ui.busy_overlay():
-        outcome = await device.admin_login(node, password)
-    ctx.admin_store.record(node, password, outcome)
-    if outcome is LoginResult.REFUSED:
-        await session.message_dialog(
-            Text(
-                f"{node.name!r} rejected the admin login (wrong password?). "
-                + ("" if prompted else "The saved password was cleared; ")
-                + "try again to enter a new one.",
-                style="err",
-            ),
-            title="Admin login",
-        )
-        return False
-    if not outcome:
-        await session.message_dialog(
-            Text(
-                f"No reply from {node.name} — it may be out of reach, asleep, or busy. "
-                + ("" if prompted else "The saved password was kept; ")
-                + "try again when it answers.",
-                style="warn",
-            ),
-            title="Admin login",
-        )
-        return False
-    return True
+    return await log_in(
+        ctx,
+        device,
+        node,
+        why="The node ignores admin commands without a login.",
+        again="try again",
+    )
 
 
 async def _admin_session(ctx: AppContext, device: Device, node: Contact) -> dict[str, Any]:
@@ -1079,6 +1046,137 @@ async def _simple_action(
     else:
         body = Text(reply.strip(), style="err" if reply_is_error(reply) else "ok")
     await ctx.ui.session.message_dialog(body, title=title)
+
+
+async def sync_clock(ctx: AppContext, node: Contact) -> None:
+    """Log in to a managed node and set its clock from ours, from outside the admin page.
+
+    This is the ``Sync clock`` row of the admin page, for the node page and the Clock drift
+    page. A managed node has its password stored, so the login asks nothing. The confirm,
+    the login, and the reply are those of the admin page.
+
+    Args:
+        ctx: The shared application context (the interactive menu must be running).
+        node: The repeater or room server.
+    """
+    device = await ctx.device()
+    if not await _login(ctx, device, node):
+        return
+    await _simple_action(
+        ctx,
+        device,
+        node,
+        "clock sync",
+        title="Sync clock",
+        prompt=f"Set {node.name}'s clock from this companion's time?",
+        commit="Sync",
+    )
+
+
+async def sync_clocks(ctx: AppContext, nodes: list[Contact]) -> None:
+    """Set the clocks of several managed nodes from ours, one node at a time.
+
+    This is the bulk ``Sync their clocks…`` of the Clock drift page. One confirm, then the
+    dialog of the run (refer to :class:`~meshterm.ui.clock_sync_dialog.ClockSyncDialog`),
+    which lists each node from the start and shows each result as it comes. For each node:
+    the wait for the transmit cooldown, a login with its stored password, and the ``clock
+    sync`` command. MeshTerm never sends a burst. The cooldown shows on the line of the next
+    node (``next in 4s``). Esc stops the run, and the dialog closes when the user says so.
+
+    Args:
+        ctx: The shared application context (the interactive menu must be running).
+        nodes: The managed repeaters and room servers to set.
+    """
+    from ..core import transmit_gate
+    from .clock_sync_dialog import ACTIVE, FAILED, OK, ClockSyncDialog
+
+    if not nodes:
+        return
+    count = f"{len(nodes)} managed {'node' if len(nodes) == 1 else 'nodes'}"
+    choice = await ctx.ui.dialog(
+        f"Set the clocks of {count} from this companion's time? MeshTerm logs in to "
+        "each one and sends one command, with a pause between them.",
+        [("Cancel", None), ("Sync", "go")],
+        title="Sync clocks",
+        default=1,
+    )
+    if choice != "go":
+        return
+    device = await ctx.device()
+    session = ctx.ui.session
+    spinner = Spinner()
+    dialog = ClockSyncDialog(nodes, spinner=spinner, invalidate=session.invalidate)
+
+    async def run() -> None:
+        for index, node in enumerate(nodes):
+            # One wait for each node, before its login. The login and the command are one
+            # exchange with one node, as on the admin page, and the command marks the
+            # transmit clock that the wait of the next node reads.
+            while (left := transmit_gate.remaining()) > 0:
+                dialog.update(index, ACTIVE, f"next in {int(left + 0.999)}s")
+                await asyncio.sleep(min(left, 0.2))
+            try:
+                dialog.update(index, ACTIVE, "logging in…")
+                ok, note = await _quiet_login(ctx, device, node)
+                if ok:
+                    dialog.update(index, ACTIVE, "setting the clock…")
+                    reply = await device.send_remote_command(
+                        node, "clock sync", timeout=_REPLY_TIMEOUT_S
+                    )
+                    if reply is None:
+                        ok, note = False, "no reply — it may still have landed"
+                    else:
+                        ok, note = not reply_is_error(reply), reply.strip()
+            except Exception as exc:  # noqa: BLE001 - one node's failure is its own line
+                ok, note = False, str(exc)
+            dialog.update(index, OK if ok else FAILED, note)
+
+    async def animate() -> None:
+        while True:
+            await asyncio.sleep(spinner_interval())
+            spinner.tick()
+            session.invalidate()
+
+    task = asyncio.ensure_future(run())
+    dialog.on_stop = task.cancel
+    task.add_done_callback(lambda _task: dialog.finish())
+    ticker = asyncio.ensure_future(animate())
+    try:
+        await session.run_screen(dialog)
+    finally:
+        task.cancel()
+        ticker.cancel()
+        for job in (task, ticker):
+            try:
+                await job
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - only the cleanup
+                pass
+
+
+async def _quiet_login(ctx: AppContext, device: Device, node: Contact) -> tuple[bool, str]:
+    """Log in to a managed node with its stored password, with no dialog.
+
+    The bulk sync shows each failure on the line of its node, not in a dialog for each
+    node. The password rules are those of :func:`_login`: a refused password is forgotten,
+    and a silence keeps it.
+
+    Returns:
+        ``(True, "")`` when the session opened, else ``(False, the reason)``.
+    """
+    from ..core.models import LoginResult
+
+    password = ctx.admin_store.get(node)
+    if password is None:
+        return False, "no stored password"
+    outcome = await device.admin_login(node, password)
+    ctx.admin_store.record(node, password, outcome)
+    if outcome is LoginResult.REFUSED:
+        return False, "login refused; the saved password was cleared"
+    if not outcome:
+        # A stock node does not answer a wrong password, so a changed password also ends
+        # here (refer to :mod:`meshterm.ui.admin_login`).
+        return False, "no reply to the login — out of reach, or its password changed"
+    return True, ""
 
 
 async def _change_password(ctx: AppContext, device: Device, node: Contact) -> None:

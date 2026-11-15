@@ -12,7 +12,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 23
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -143,8 +143,10 @@ CREATE TABLE IF NOT EXISTS observations (
     trace_snrs  TEXT,             -- TRACE rows: comma-separated per-hop SNR readings (dB)
     route       TEXT,             -- 'packet' rows: FLOOD/DIRECT/… — what `path` MEANS here
     transport_code TEXT,          -- scoped (TC_*) rows: the 4-byte transport-codes field (hex)
-    scope_body  TEXT              -- TC_FLOOD rows: payload type byte + payload (hex), the
+    scope_body  TEXT,             -- TC_FLOOD rows: payload type byte + payload (hex), the
                                   --   HMAC input a region name is resolved against
+    sent_at     TEXT              -- ADVERT packet rows: the advert's own time, by the
+                                  --   sender's clock (observed_at is ours)
 );
 
 -- One chat message, sent or received, on a channel or with a contact. Unlike the other
@@ -165,7 +167,26 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at  TEXT    NOT NULL,
     scope       TEXT,             -- outbound floods: the region it was sent under, '*' for
                                   --   unscoped, NULL where it was never known
-    author      TEXT              -- a room post: its author's key prefix (peer is the room)
+    author      TEXT,             -- a room post: its author's key prefix (peer is the room)
+    received_at TEXT,             -- inbound: our clock when we got it from the companion
+                                  --   (created_at is the sender's clock); NULL outbound/old
+    waited      INTEGER NOT NULL DEFAULT 0  -- inbound: it came out of the companion's queue
+                                  --   at connect, so it arrived some time before received_at
+);
+
+-- The place of a node: the named area nearest its location (refer to meshterm.core.places).
+-- It is derived data, found from the map tiles or from Nominatim, and stored so that each
+-- location is looked up one time only. The node moves past MOVE_KM, and it is found again.
+-- Both parts NULL is a stored "the source answered, and there is no place here".
+CREATE TABLE IF NOT EXISTS node_places (
+    node      TEXT PRIMARY KEY,   -- 12-hex canonical id (as observations.node)
+    lat       REAL NOT NULL,      -- the location that the place was found for
+    lon       REAL NOT NULL,
+    fine      TEXT,               -- the most precise name: a neighbourhood, a village, a peak
+    coarse    TEXT,               -- the town or city that holds it, or NULL
+    peak      INTEGER NOT NULL DEFAULT 0,  -- fine is a peak near its summit
+    source    TEXT NOT NULL,      -- 'tiles' or 'nominatim'
+    found_at  TEXT NOT NULL       -- UTC ISO-8601
 );
 
 CREATE INDEX IF NOT EXISTS idx_traces_run ON traces(run_id);
@@ -396,6 +417,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # Rows from before this column are NULL too: when MeshTerm stored such a post, the
         # author was lost on the way in, and nothing on disk can bring it back.
         conn.execute("ALTER TABLE messages ADD COLUMN author TEXT")
+    if "received_at" not in message_cols:
+        # v20 -> v21: the arrival time of a received message. ``created_at`` holds the time
+        # that the sender put on the message, from its own clock, and a node with a wrong
+        # clock makes that time false by hours or by years. ``received_at`` is our clock
+        # when MeshTerm got the message from the companion. ``waited`` is 1 when the message
+        # came out of the queue of the companion at connect, so that it arrived at an
+        # unknown time before that. Old rows keep NULL and 0: MeshTerm did not keep the
+        # time, and nothing can bring it back. Each query uses ``created_at`` for them, as
+        # before (refer to Repository._ARRIVED_AT).
+        conn.execute("ALTER TABLE messages ADD COLUMN received_at TEXT")
+        conn.execute("ALTER TABLE messages ADD COLUMN waited INTEGER NOT NULL DEFAULT 0")
+    # The report of clock offsets reads the received messages of a time window by their
+    # arrival time.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at)")
+    if "sent_at" not in observation_cols:
+        # v21 -> v22: the own time of an advert. An advert carries the clock of its sender,
+        # and ``observed_at`` is our clock when we heard it. The difference is the clock
+        # offset of that node (refer to meshterm.services.clock_offsets). Only the RX log
+        # gives the time of an advert, so only ADVERT packet rows have it. Older rows have
+        # NULL: the raw packet was never stored, so nothing can bring the time back.
+        conn.execute("ALTER TABLE observations ADD COLUMN sent_at TEXT")
+    # Only the rows with an advert time, by node and then by time: the offset of one node
+    # reads its newest few, and the report reads a time window.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_sent ON observations(node, observed_at) "
+        "WHERE sent_at IS NOT NULL"
+    )
 
     stored = conn.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()
     if stored is not None and int(stored["value"]) < 19:

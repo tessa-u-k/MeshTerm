@@ -54,7 +54,7 @@ from .advert_store import DEFAULT_QUIET_S, QUIET_CHOICES_S
 from .atomicwrite import write_atomically
 from .courier_store import DONE_CAP
 from .geo import DEFAULT_VIEW_FRACTION
-from .models import NAME_OVERLAP_DAYS
+from .models import CLOCK_TOLERANCE_S, NAME_OVERLAP_DAYS
 from .watch_store import ALERT_CAP, DEFAULT_SILENCE_HOURS, OFF, SILENCE_CHOICES_H
 
 if sys.version_info >= (3, 11):
@@ -154,6 +154,15 @@ class PrefSpec:
 #: sees, not the mechanism: an age is how long ago, and a timestamp is when.
 _CLI_TIME_CHOICES: dict[str, str] = {"relative": "ages", "absolute": "timestamps"}
 
+#: The sources of the place of a node (refer to :mod:`meshterm.services.places`). With
+#: ``tiles_nominatim``, the map tiles give the first answer at once, and Nominatim corrects it
+#: later, when MeshTerm is online, because only Nominatim knows the boundaries of a place.
+_PLACE_SOURCE_CHOICES: dict[str, str] = {
+    "tiles_nominatim": "tiles, then Nominatim",
+    "tiles": "map tiles",
+    "nominatim": "Nominatim",
+}
+
 #: The choices for the silence rule. They come from the ring of the Watchtower itself, so
 #: that the two lists always agree.
 _SILENCE_CHOICES: dict[int, str] = {
@@ -252,6 +261,17 @@ PREFERENCES: tuple[PrefSpec, ...] = (
         # connection. Refer to :mod:`meshterm.services.clock_sync`.
         default=False,
     ),
+    PrefSpec(
+        key="suggest_site",
+        label="Suggest a site",
+        help="Offer the site whose outbound paths your radio hears",
+        group="Device",
+        value_type="bool",
+        # On: the offer only asks, and it says what it heard. It never changes the active
+        # site by itself. Its dialog has a choice that sets this preference off. Refer to
+        # meshterm.services.site_suggest.
+        default=True,
+    ),
     # --- Sending -----------------------------------------------------------------
     PrefSpec(
         key="trace_cooldown_s",
@@ -321,6 +341,33 @@ PREFERENCES: tuple[PrefSpec, ...] = (
         minimum=1,
         maximum=1440,
         unit="min",
+    ),
+    PrefSpec(
+        key="outbound_silent_hours",
+        label="Silent path",
+        help="Skip an outbound path whose first hop is this quiet",
+        group="Sending",
+        value_type="int",
+        # A repeater that relayed nothing that our node heard for a day is probably off, or
+        # out of reach from where the radio is now. A route through it fails, so the route
+        # suggestions skip it. A first hop with no evidence at all is not silent: it is
+        # unknown, and the user named it. Refer to meshterm.services.topology.
+        default=24,
+        minimum=1,
+        maximum=720,
+        unit="h",
+    ),
+    PrefSpec(
+        key="auto_route",
+        label="Auto route",
+        help="Before a DM, set the suggested route if the radio has none",
+        group="Sending",
+        value_type="bool",
+        # Off: the suggested route comes from evidence, and a wrong one loses the message,
+        # where a flood finds a way. On, MeshTerm sets it before a direct message when the
+        # radio has no route, or a route that starts on another site's first hop. A kept
+        # route is never changed. Refer to meshterm.services.device_routes.
+        default=False,
     ),
     # --- TX optimize -------------------------------------------------------------
     PrefSpec(
@@ -395,6 +442,23 @@ PREFERENCES: tuple[PrefSpec, ...] = (
         value_type="str",
         default="https://tiles.openfreemap.org/planet",
         relaunch=True,
+    ),
+    PrefSpec(
+        key="place_source",
+        label="Place names",
+        help="Where the place of a node comes from",
+        group="Map",
+        value_type="enum",
+        default="tiles_nominatim",
+        choices=_PLACE_SOURCE_CHOICES,
+    ),
+    PrefSpec(
+        key="nominatim_url",
+        label="Nominatim",
+        help="The server that finds places by their boundaries",
+        group="Map",
+        value_type="str",
+        default="https://nominatim.openstreetmap.org",
     ),
     # --- History kept ------------------------------------------------------------
     PrefSpec(
@@ -518,6 +582,34 @@ PREFERENCES: tuple[PrefSpec, ...] = (
         default=NAME_OVERLAP_DAYS,
         minimum=0,
         maximum=3650,
+        unit="days",
+    ),
+    PrefSpec(
+        key="clock_tolerance_s",
+        label="Clock tolerance",
+        help="How far a node's clock can be off before its times are wrong",
+        group="Display",
+        value_type="int",
+        # A message whose sender time is farther than this from its arrival shows the
+        # arrival time, with a ? mark. An advert time farther than this in the future is
+        # refused. Five minutes: a node with no time source drifts by seconds each day, and
+        # a larger error is a clock that nobody set.
+        default=CLOCK_TOLERANCE_S,
+        minimum=30,
+        maximum=86400,
+        unit="s",
+    ),
+    PrefSpec(
+        key="clock_report_days",
+        label="Clock report",
+        help="How many days of packets the Clock drift page reads",
+        group="Display",
+        value_type="int",
+        # A week: long enough to hear each repeater advert a few times, and short enough
+        # that a clock that its owner set last month no longer counts against the node.
+        default=7,
+        minimum=1,
+        maximum=365,
         unit="days",
     ),
     PrefSpec(

@@ -8,6 +8,7 @@ The CLI prints only the contact list, because our node is not a contact.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import typer
@@ -19,6 +20,7 @@ from .base import Tool, ToolResult, register
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..core.models import Contact
+    from ..core.places import Place
     from ..ui.report import Listing
 
 
@@ -44,7 +46,12 @@ class ContactsTool(Tool):
             A :class:`ToolResult` with a summary of the number of known contacts.
         """
         from ..ui.surface import TuiUi
-        from ..ui.widgets import ContactsSort, ordered_contacts
+        from ..ui.widgets import (
+            CONTACTS_SORT_COLUMNS,
+            CONTACTS_SORT_OPENS_ASCENDING,
+            ContactsSort,
+            ordered_contacts,
+        )
 
         # Read through the session cache. On a busy node, the contacts table is a slow
         # round trip. If MeshTerm reads it again (and the self info) at each visit to the
@@ -74,21 +81,35 @@ class ContactsTool(Tool):
         # A list from A to Z does not. Then the Ctrl+arrows sort the list again (and
         # ``--sort`` sets the order of the CLI).
         sort_name = str(params.get("sort") or "heard")
+        # The two faces use the same ring: the five columns of the Contacts list (also the
+        # place and the hash).
+        sort = ContactsSort.from_name(
+            sort_name, CONTACTS_SORT_COLUMNS, CONTACTS_SORT_OPENS_ASCENDING
+        )
 
         # In the menu, give the list to the interactive screen, so that the Ctrl+arrows sort
-        # it again while it is open. Their ring goes through the four columns of the shared
-        # contact list (also the hash). On the scripted CLI, print the plain listing one
-        # time, in the requested order.
+        # it again while it is open. On the scripted CLI, print the plain listing one time,
+        # in the requested order.
         if isinstance(ctx.ui, TuiUi):
-            from ..ui.contactlist import SORT_COLUMNS, SORT_OPENS_ASCENDING
             from ..ui.contacts_screen import open_contacts
 
-            sort = ContactsSort.from_name(sort_name, SORT_COLUMNS, SORT_OPENS_ASCENDING)
             await open_contacts(ctx, self_name, self_key, contacts, prefix_bytes, counts, sort)
             return ToolResult(summary={"contacts": len(contacts)})
 
-        sort = ContactsSort.from_name(sort_name)
-        listing = _listing(ordered_contacts(contacts, counts, sort), counts, prefix_bytes)
+        # The CLI reads the stored places only. It never starts the job that finds them.
+        places = getattr(ctx, "places", None)
+        place_of = _place_lookup(places.get) if places is not None else None
+        listing = _listing(
+            ordered_contacts(
+                contacts,
+                counts,
+                sort,
+                (lambda c: _place_label(place_of(c))) if place_of else None,
+            ),
+            counts,
+            prefix_bytes,
+            place_of,
+        )
         return ToolResult(
             summary={"contacts": len(contacts)},
             report=(listing,),
@@ -102,30 +123,53 @@ class ContactsTool(Tool):
             app: The Typer application.
         """
         from ..cli import run_tool_command
-        from ..ui.widgets import ContactsSort
+        from ..ui.widgets import CONTACTS_SORT_COLUMNS, ContactsSort
 
         @app.command(name=self.name, help=self.help)
         def _contacts(
             sort: str = typer.Option(
-                "heard", "--sort", "-s", help="Order contacts by: heard, name, packets"
+                "heard",
+                "--sort",
+                "-s",
+                help="Order contacts by: heard, name, packets, place, hash",
             ),
         ) -> None:
             # For an unknown name, `ContactsSort.from_name` uses the first column. This is
             # on purpose, so that a saved preference from an older build cannot block the
             # list of the menu. On the command line, the same silence hides a typing error:
             # the caller asked for one order and got another, and nothing said so.
-            if sort not in ContactsSort.names():
-                choices = ", ".join(ContactsSort.names())
+            if sort not in ContactsSort.names(CONTACTS_SORT_COLUMNS):
+                choices = ", ".join(ContactsSort.names(CONTACTS_SORT_COLUMNS))
                 raise typer.BadParameter(f"--sort must be one of: {choices} (got {sort!r})")
             run_tool_command(self, {"sort": sort})
 
 
-def _listing(contacts: list[Contact], counts: dict[str, int], prefix_bytes: int) -> Listing:
+def _place_lookup(get: Callable[[str], Place | None]) -> Callable[[Contact], Place | None]:
+    """Give the stored place of a contact, from a lookup by key (or key prefix)."""
+
+    def place_of(contact: Contact) -> Place | None:
+        return get((contact.public_key or contact.key_prefix).lower())
+
+    return place_of
+
+
+def _place_label(place: Place | None) -> str | None:
+    """The full label of a place (``Villeray, Montréal``), or ``None`` for no place."""
+    return (place.label or None) if place else None
+
+
+def _listing(
+    contacts: list[Contact],
+    counts: dict[str, int],
+    prefix_bytes: int,
+    place_of: Callable[[Contact], Place | None] | None = None,
+) -> Listing:
     """The contact list, stated one time for the two faces.
 
     ``TYPE`` is the advertised role of the node, in words. The menu draws a coloured glyph
     there, but a monochrome ``▲`` must have a legend, and the CLI has no legends.
     ``HEARD`` is a relative age, because the user opens this listing to ask "recently?".
+    ``PLACE`` is the named area nearest the location of the node. It is just before ``KEY``.
     ``HASH`` is the token that ``--path`` and ``--to`` accept. Before, the user had to cut
     it out of ``KEY`` by hand. ``LOCATION`` is a fact that the model always had, but no
     column had space for it. ``KEY`` stays full and last. Thus it goes off the right side
@@ -138,6 +182,8 @@ def _listing(contacts: list[Contact], counts: dict[str, int], prefix_bytes: int)
         prefix_bytes: The path hash width of the device. Because of it, ``HASH`` is the
             token by which a forced path addresses this node, not a random part of the
             key.
+        place_of: Gives the stored place of a contact, or ``None``. ``PLACE`` is the label
+            of that place, and it is ``null`` in the document when there is none.
 
     Returns:
         The listing.
@@ -149,6 +195,7 @@ def _listing(contacts: list[Contact], counts: dict[str, int], prefix_bytes: int)
     rows = []
     for contact in contacts:
         key = (contact.public_key or "").lower()
+        place = place_of(contact) if place_of else None
         rows.append(
             {
                 "node": fields.NodeRef(
@@ -156,6 +203,7 @@ def _listing(contacts: list[Contact], counts: dict[str, int], prefix_bytes: int)
                     key=key or None,
                     hash=(key or contact.key_prefix.lower())[: prefix_bytes * 2] or None,
                     type=NODE_TYPE_LABELS.get(contact.node_type),
+                    place=_place_label(place),
                 ),
                 "heard_at": contact.last_seen,
                 "packets": contact_packets(contact, counts),
@@ -169,14 +217,21 @@ def _listing(contacts: list[Contact], counts: dict[str, int], prefix_bytes: int)
         columns=(
             fields.node(
                 "node",
-                lanes=(("name", "NAME"), ("type", "TYPE"), ("hash", "HASH"), ("key", "KEY")),
+                lanes=(
+                    ("name", "NAME"),
+                    ("type", "TYPE"),
+                    ("hash", "HASH"),
+                    ("place", "PLACE"),
+                    ("key", "KEY"),
+                ),
             ),
             fields.when("heard_at", "HEARD", absent="never"),
             fields.integer("packets", "PKTS"),
             fields.position(),
         ),
         rows=rows,
-        # The four lanes of the node are not together. What the user looks for (who, what,
-        # how recently, how much) comes first, and the two long hex fields go to the right.
-        order=("NAME", "TYPE", "HEARD", "PKTS", "HASH", "LOCATION", "KEY"),
+        # The five lanes of the node are not together. What the user looks for (who, what,
+        # how recently, how much) comes first, and the long fields go to the right. PLACE is
+        # just before KEY, the same as in the menu.
+        order=("NAME", "TYPE", "HEARD", "PKTS", "HASH", "LOCATION", "PLACE", "KEY"),
     )

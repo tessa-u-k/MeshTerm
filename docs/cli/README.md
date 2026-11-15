@@ -32,7 +32,7 @@ instead, because the plain face can change between releases.
   - [The mesh around you](#the-mesh-around-you)
   - [Messaging](#messaging)
   - [Tracing](#tracing)
-  - [Other nodes](#other-nodes)
+  - [Managed nodes](#managed-nodes)
   - [MeshTerm itself](#meshterm-itself)
 - [Recipes](#recipes)
 - [What has no command](#what-has-no-command)
@@ -156,8 +156,9 @@ samples:
   matching width, they match.
 - **A `trace` that the device routes invents its hop names.** If you give
   `trace --target NAME` with no `--path`, the simulator router returns placeholder hops.
-  A forced path (`--path "a1,d4"`) resolves correctly. The samples use the forced form.
-  Use the forced form also to build a golden file.
+  A forced path (`--path "a1,b2,a1"`) resolves correctly. The samples use the forced
+  form. Use the forced form also to build a golden file. As on the real mesh, a forced
+  path through a simulated companion or room server never comes home.
 
 > **`--mock` records into its own history, not yours, but it still writes the caches.**
 > The simulator is a fake radio. It is not a fake MeshTerm. MeshTerm stores what the
@@ -189,11 +190,11 @@ Numeric columns align to the right.
 
 ```console
 $ meshterm contacts
-NAME            TYPE      HEARD  PKTS  HASH  LOCATION            KEY
-Observer-Bot    node         7m     -  c3    45.48800,-73.58100  c3d4e5f600000000000000000000000000000000000000000000000000000000
-Local-Repeater  repeater     7m     -  b2    45.47680,-73.59900  b2c3d4e500000000000000000000000000000000000000000000000000000000
-Yagi-Repeater   repeater     7m     -  a1    45.50190,-73.56740  a1b2c3d400000000000000000000000000000000000000000000000000000000
-Alice           node         7m     -  d4    -                   d4e5f6a700000000000000000000000000000000000000000000000000000000
+NAME            TYPE      HEARD  PKTS  HASH  LOCATION            PLACE  KEY
+Observer-Bot    node         7m     -  c3    45.48800,-73.58100  -      c3d4e5f600000000000000000000000000000000000000000000000000000000
+Local-Repeater  repeater     7m     -  b2    45.47680,-73.59900  -      b2c3d4e500000000000000000000000000000000000000000000000000000000
+Yagi-Repeater   repeater     7m     -  a1    45.50190,-73.56740  -      a1b2c3d400000000000000000000000000000000000000000000000000000000
+Alice           node         7m     -  d4    -                   -      d4e5f6a700000000000000000000000000000000000000000000000000000000
 ```
 
 Names are not in quotation marks. Quotation marks would give a script a delimiter, and
@@ -212,11 +213,11 @@ the second:
 
 ```console
 $ meshterm --absolute contacts
-NAME            TYPE                           HEARD  PKTS  HASH  LOCATION            KEY
-Observer-Bot    companion  2026-09-08T04:30:50-04:00     -  c3    45.48800,-73.58100  c3d4e5f600000000000000000000000000000000000000000000000000000000
-Local-Repeater  repeater   2026-09-08T04:30:49-04:00     -  b2    45.47680,-73.59900  b2c3d4e500000000000000000000000000000000000000000000000000000000
-Yagi-Repeater   repeater   2026-09-08T04:30:49-04:00     -  a1    45.50190,-73.56740  a1b2c3d400000000000000000000000000000000000000000000000000000000
-Alice           companion  2026-09-08T04:30:48-04:00     -  d4    -                   d4e5f6a700000000000000000000000000000000000000000000000000000000
+NAME            TYPE                           HEARD  PKTS  HASH  LOCATION            PLACE  KEY
+Observer-Bot    companion  2026-09-08T04:30:50-04:00     -  c3    45.48800,-73.58100  -      c3d4e5f600000000000000000000000000000000000000000000000000000000
+Local-Repeater  repeater   2026-09-08T04:30:49-04:00     -  b2    45.47680,-73.59900  -      b2c3d4e500000000000000000000000000000000000000000000000000000000
+Yagi-Repeater   repeater   2026-09-08T04:30:49-04:00     -  a1    45.50190,-73.56740  -      a1b2c3d400000000000000000000000000000000000000000000000000000000
+Alice           companion  2026-09-08T04:30:48-04:00     -  d4    -                   -      d4e5f6a700000000000000000000000000000000000000000000000000000000
 ```
 
 The flag **overrides a preference**. It is not a second switch that works beside the
@@ -230,8 +231,8 @@ would be a behaviour that nobody can find.
 different. These are two lines from the facts block of a trace:
 
 ```
-path        a1,d4
-route       MockCompanion (00) → Yagi-Repeater (a1) → Alice (d4) → MockCompanion (00)
+path        a1,b2
+route       MockCompanion (00) → Yagi-Repeater (a1) → Local-Repeater (b2) → MockCompanion (00)
 ```
 
 A **path** is a spec. It is the list of hops that you write and force. It is the one line
@@ -403,11 +404,11 @@ interactive session cannot emit a document.
 This section defines each shape one time. The tables for each command below use the names
 and do not repeat the definitions.
 
-**`node`** is the identity of a mesh participant, and nothing else. All five keys are
+**`node`** is the identity of a mesh participant, and nothing else. All six keys are
 always present.
 
 ```json
-{"name":"Yagi-Repeater","key":"a1b2c3d400000000000000000000000000000000000000000000000000000000","hash":"a1","type":"repeater","self":false}
+{"name":"Yagi-Repeater","key":"a1b2c3d400000000000000000000000000000000000000000000000000000000","hash":"a1","type":"repeater","place":"Villeray, Montréal","self":false}
 ```
 
 | Field | Type | Meaning |
@@ -416,6 +417,7 @@ always present.
 | `key` | string \| null | The full public key, in lowercase hex, 64 characters. `null` when MeshTerm heard only a hash. |
 | `hash` | string \| null | The short id that comes from the key. Its width is the width that the command used to address the node. It is never a `key` that is cut short. |
 | `type` | string \| null | `"companion"` \| `"repeater"` \| `"room server"` \| `"sensor"` \| `null`. |
+| `place` | string or null | The full label of the place of the node, the named area nearest its location (`Villeray, Montréal`). `null` when MeshTerm knows no place. The command reads the stored places only. |
 | `self` | boolean | `true` for our node. This is what the star of the menu shows. The plain face deliberately does not show it. |
 
 Reception facts belong to the **row** and not to the node. These facts are when MeshTerm
@@ -562,7 +564,7 @@ $ meshterm contacts --sort bogus
 Usage: meshterm contacts [OPTIONS]
 Try 'meshterm contacts --help' for help.
 
-Error: Invalid value: --sort must be one of: name, heard, packets (got 'bogus')
+Error: Invalid value: --sort must be one of: name, heard, packets, place, hash (got 'bogus')
 ```
 
 **A confirmation that you did not give** is in the same class, because nothing has
@@ -623,7 +625,7 @@ $ meshterm contacts --sort bogus --json
 Usage: meshterm contacts [OPTIONS]
 Try 'meshterm contacts --help' for help.
 
-Error: Invalid value: --sort must be one of: name, heard, packets (got 'bogus')
+Error: Invalid value: --sort must be one of: name, heard, packets, place, hash (got 'bogus')
 $ echo $?
 2
 ```
@@ -893,15 +895,15 @@ The contacts that your device knows.
 
 | Option | What it does |
 | --- | --- |
-| `-s`, `--sort ORDER` | `heard` (default), `name`, or `packets`. |
+| `-s`, `--sort ORDER` | `heard` (default), `name`, `packets`, `place`, or `hash` (the key). |
 
 ```console
 $ meshterm contacts --sort name
-NAME            TYPE       HEARD  PKTS  HASH  LOCATION            KEY
-Alice           companion     7m     -  d4    -                   d4e5f6a700000000000000000000000000000000000000000000000000000000
-Local-Repeater  repeater      7m     -  b2    45.47680,-73.59900  b2c3d4e500000000000000000000000000000000000000000000000000000000
-Observer-Bot    companion     7m     -  c3    45.48800,-73.58100  c3d4e5f600000000000000000000000000000000000000000000000000000000
-Yagi-Repeater   repeater      7m     -  a1    45.50190,-73.56740  a1b2c3d400000000000000000000000000000000000000000000000000000000
+NAME            TYPE       HEARD  PKTS  HASH  LOCATION            PLACE  KEY
+Alice           companion     7m     -  d4    -                   -      d4e5f6a700000000000000000000000000000000000000000000000000000000
+Local-Repeater  repeater      7m     -  b2    45.47680,-73.59900  -      b2c3d4e500000000000000000000000000000000000000000000000000000000
+Observer-Bot    companion     7m     -  c3    45.48800,-73.58100  -      c3d4e5f600000000000000000000000000000000000000000000000000000000
+Yagi-Repeater   repeater      7m     -  a1    45.50190,-73.56740  -      a1b2c3d400000000000000000000000000000000000000000000000000000000
 ```
 
 `TYPE` is the node's advertised role in words: `companion`, `repeater`, `room server`,
@@ -1051,6 +1053,52 @@ correct.
 | `route` | array | The `route` shape, with hops that match `path`. |
 
 The command returns `5` and `[]` when no records match.
+
+#### `meshterm clocks`
+
+How far the clock of each node is from the clock of this computer. The command reads the
+database. It needs no device and never transmits. A node with a wrong clock puts wrong
+times on its adverts and messages, and only its owner can set the clock. This listing
+tells you which owners to tell.
+
+Each advert, direct message, and channel message that MeshTerm heard is a clock sample:
+the time that the sender wrote, minus the time when MeshTerm heard it. The offset of a node
+is the median of its three newest samples. The listing has each sender with a sample in
+the last `clock_report_days` (a preference, 7 by default), the largest offset first.
+
+```console
+$ meshterm --demo clocks
+NAME             TYPE         HASH          OFFSET  SAMPLES  LAST  MANAGED
+Île-Bizard       repeater     3cc49c  2y 5w behind       16    3h  no
+Wio Tracker      companion    a09028  3d 7h behind       32    1d  no
+Steve K.         companion    220c44     5h behind       38   24m  no
+Gabriel          companion    7fc6ea  1h 24m ahead       40   21m  no
+Chloé L.         companion    c9d961       in sync       48    9h  no
+```
+
+`OFFSET` is `in sync` when the offset is within the `clock_tolerance_s` preference (300 s
+by default). `LAST` is the age of the newest sample. `MANAGED` is `yes` when MeshTerm
+stores the admin password of the node. A channel sender whose name matches no single key
+has only its name, with no `TYPE` and no `HASH`.
+
+Each managed node is a row, also when it sent no sample in the window. Its offset is then
+the newest from all the history, and `LAST` shows how old that sample is. A managed node
+that never sent a sample is last, with `no sample` and a `LAST` of `never`. A repeater
+sends no message, so its adverts are its only samples.
+
+**`--json`** is an array of rows.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `node` | object | The `node` shape. A sender with no key has only `name`. |
+| `offset_s` | integer \| null | The offset in seconds. A positive value is a clock ahead of this computer. `null` for a managed node that never sent a sample. |
+| `samples` | integer | The number of samples. `0` for a managed node that never sent one. |
+| `last_sample_at` | timestamp \| null | When MeshTerm heard the newest sample. `null` is the `never` of the plain face. |
+| `out_of_sync` | boolean | **JSON only.** `true` when the offset is past `clock_tolerance_s`. It is the `in sync` of the plain face, inverted. |
+| `managed` | boolean | `true` when MeshTerm stores the admin password of the node. |
+| `keyed` | boolean | **JSON only.** `false` for a channel sender that has only a name. |
+
+The command returns `5` and `[]` when the window has no sample.
 
 ---
 
@@ -1500,19 +1548,20 @@ Walk the path to a target one time and report what came back.
 without a target is [`trace-path`](#meshterm-trace-path).
 
 ```console
-$ meshterm trace --target Alice --path "a1,d4"
-target      Alice
-path        a1,d4
+$ meshterm trace --target Local-Repeater --path "a1,b2,a1"
+target      Local-Repeater
+path        a1,b2,a1
 success     yes
-hops        3
+hops        4
 min_snr_db  +2.0
-rtt_ms      123
-route       MockCompanion (00) → Yagi-Repeater (a1) → Alice (d4) → MockCompanion (00)
+rtt_ms      458
+route       MockCompanion (00) → Yagi-Repeater (a1) → Local-Repeater (b2) → Yagi-Repeater (a1) → MockCompanion (00)
 
 HOP  FROM  TO  SNR_DB
   0  00    a1    +6.0
-  1  a1    d4    +2.0
-  2  d4    00    +6.0
+  1  a1    b2    +2.0
+  2  b2    a1    +2.4
+  3  a1    00    +6.0
 ```
 
 The output has two blocks. The first block shows what the walk did. It has the drawn
@@ -1525,6 +1574,24 @@ and the hash joins the two blocks.
 A trace that never came home is **not** a failure of the command. The radio transmitted,
 and the walk ran. The command reports `success no` and returns `5`.
 
+A companion, a room server, or a sensor does not relay a trace, so a walk that turns at
+one of them never comes home. When the target is one of these and you omit `--path`,
+MeshTerm chooses the route as the menu does. Then the walk turns at the last repeater of
+that route. A line on stderr names that repeater, and `path` shows the walk:
+
+```console
+$ meshterm trace --target Alice
+Alice can't relay a trace, so the trace turns at Yagi-Repeater (device route)
+target      Alice
+path        a1
+success     yes
+...
+```
+
+The route out of that walk is also the route that the radio can use to send to the
+target. If MeshTerm knows no repeater on the way to the target, nothing is transmitted,
+and the command returns `2`.
+
 #### `meshterm trace-path`
 
 The other half of tracing. It has no target. You compose a path by hand, out and back, in
@@ -1535,19 +1602,19 @@ any way that you choose. The path only has to end where this node can hear it.
 | `--path SPEC` | **Required.** The whole walk, comma-separated. |
 
 ```console
-$ meshterm trace-path --path "a1,d4,a1"
+$ meshterm trace-path --path "a1,b2,a1"
 target      -
-path        a1,d4,a1
+path        a1,b2,a1
 success     yes
 hops        4
 min_snr_db  +2.0
 rtt_ms      458
-route       MockCompanion (00) → Yagi-Repeater (a1) → Alice (d4) → Yagi-Repeater (a1) → MockCompanion (00)
+route       MockCompanion (00) → Yagi-Repeater (a1) → Local-Repeater (b2) → Yagi-Repeater (a1) → MockCompanion (00)
 
 HOP  FROM  TO  SNR_DB
   0  00    a1    +6.0
-  1  a1    d4    +2.0
-  2  d4    a1    +2.4
+  1  a1    b2    +2.0
+  2  b2    a1    +2.4
   3  a1    00    +6.0
 ```
 
@@ -1571,9 +1638,158 @@ table of hops is under `edges`.
 | `edges` | array | The `edge` shape, one for each hop, in the order of the walk. `[]` when nothing came home. |
 
 ```console
-$ meshterm trace-path --path "a1,d4" --json | jq -r '.edges | min_by(.snr_db) | "\(.from.hash) -> \(.to.hash)  \(.snr_db) dB"'
-a1 -> d4  2.0 dB
+$ meshterm trace-path --path "a1,b2" --json | jq -r '.edges | min_by(.snr_db) | "\(.from.hash) -> \(.to.hash)  \(.snr_db) dB"'
+a1 -> b2  2.0 dB
 ```
+
+#### `meshterm outbound`
+
+Show and change the outbound paths: the ways out of your node that the trace features
+start their routes on. A path is a spec, the same as `--path` (`3d63,f2c2`), from your
+node outward. Each site of this computer has its own paths, and one site is active. A
+fixed device keeps its own paths, and the active site does not apply to it.
+
+| Command | What it does |
+| --- | --- |
+| `outbound` or `outbound show` | The paths that apply to the connected device now, and where they come from. |
+| `outbound sites` | Each site, whether it is active, and its paths. |
+| `outbound use SITE` | Make a site active. `outbound use --none` makes no site active. |
+| `outbound set SITE PATH…` | Make a site, or replace its paths, in your order. When no site is active, the new site becomes active. |
+| `outbound remove SITE --yes` | Delete a site and its paths. |
+| `outbound fix [PATH…]` | Give the connected device its own paths. With no path, it starts with the paths of the active site. |
+| `outbound unfix --yes` | The connected device follows the active site again. |
+
+```console
+$ meshterm outbound set Home 3d63c6429436 27d4,f2c2
+✓ site Home: 2 outbound path(s)
+$ meshterm outbound sites
+SITE    ACTIVE  PATHS
+Home    yes     3d63c6429436 27d4,f2c2
+Foulab  no      a100
+$ meshterm outbound
+SOURCE  site
+NAME    Home
+
+RANK  PATH          HOPS
+   1  3d63c6429436  3d63c6429436
+   2  27d4,f2c2     27d4 → f2c2
+```
+
+`sites`, `use`, `set`, and `remove` do not open the device. `show`, `fix`, and `unfix`
+open it, because the fixed devices are known by their public key. `show` returns `5` when
+no list applies. `sites` returns `5` when there is no site. A path with a node two times,
+or a hop that is not whole bytes of hex, is a usage error (`2`).
+
+**`--json`** gives `show` as one object, `{"source": …, "name": …, "paths": [{"rank": …,
+"path": …, "hops": […]}]}`. `source` is `site`, `device`, or `null`. `sites` is an array of
+`{"site", "active", "paths"}`. Each change prints the object that it wrote, for example
+`{"active": "Foulab"}`.
+
+#### `meshterm route`
+
+Show, change, and keep the device routes. The companion holds one *device route* for each
+contact: the relays from your node to the contact. With no route, the radio floods the next
+message. With an empty route, the contact is a neighbour. The radio replaces the route each
+time that it learns a new one, and it never forgets a route that stopped to work. A route
+that you **keep** belongs to the active site (or to a fixed device). MeshTerm writes a kept
+route back each time that the radio replaces it.
+
+A contact is its name, or the first digits of its key. A `SPEC` is the same as `--path` of a
+trace: hops in hex, separated by commas (`a1,3d`). An empty `SPEC` (`--path ""`) means no
+relay.
+
+| Command | What it does |
+| --- | --- |
+| `route` or `route list` | Each contact that has a device route or a kept route. |
+| `route show CONTACT` | The route to one contact, how the radio got it, and where you keep it. |
+| `route set CONTACT --path SPEC` | Write a route to the radio. `--keep` also keeps it. |
+| `route forget CONTACT --yes` | Clear the route, so that the next message floods. A kept route stays kept. |
+| `route keep CONTACT [--path SPEC]` | Keep a route. With no `--path`, MeshTerm keeps the route that the radio holds now. |
+| `route unkeep CONTACT` | Stop keeping the route. The radio keeps the route that it holds. |
+| `route discover CONTACT [--use]` | Send one path discovery and show the route each way. `--use` writes the outward route to the radio. |
+| `route sync` | Make the routes of the radio follow the active site and the kept routes now. |
+
+```console
+$ meshterm route list
+NAME            TYPE         HASH  PATH      ORIGIN   KEPT  ROUTE
+Alice           companion    d4    a1b2c3d4  kept     a1    MockCompanion (00) → Yagi-Repeater (a1b2c3d4) → Alice (d4)
+Local-Repeater  repeater     b2    direct    learned  -     MockCompanion (00) → Local-Repeater (b2)
+$ meshterm route show Alice
+node             Alice
+type             companion
+hash             d4
+key              d4e5f6a700000000000000000000000000000000000000000000000000000000
+path             a1b2c3d4
+origin           kept
+kept             a1
+kept_by          site Home
+kept_in_radio    yes
+skipped          no
+first_hop_heard  -
+route            MockCompanion (00) → Yagi-Repeater (a1b2c3d4) → Alice (d4)
+```
+
+`path` is the route that the radio holds, and `kept` is the route that you keep. Both are
+specs, and a spec goes back into `--path` as it is. `direct` is the plain word for an empty
+spec, and `-` means no route. `origin` is `kept`, `set` (you wrote it in this run), `learned`
+(the radio got it from a path return), or `flood` (no route). The drawn `route` has your node
+and the contact at its ends. `skipped` is `yes` when MeshTerm does not write the kept route
+back because its first hop is silent, and `first_hop_heard` then says when MeshTerm last heard
+that hop.
+
+`discover` sends one path discovery. It is one transmission, and the command waits for the
+answer. It prints the route in each direction, because a radio link is not symmetric. The
+radio does not change its route for this request. With `--use`, MeshTerm writes the outward
+route.
+
+```console
+$ meshterm route discover Alice
+node       Alice
+hash       d4
+answered   yes
+out_path   a1
+in_path    a1
+used       no
+out_route  MockCompanion (00) → Yagi-Repeater (a1) → Alice (d4)
+in_route   Alice (d4) → Yagi-Repeater (a1) → MockCompanion (00)
+```
+
+`sync` does what MeshTerm does at each connection. It saves the routes that the radio
+learned at another site, and clears them from the radio. It writes back the routes that
+belong to the active site, and the routes that you keep. It prints what it did on stderr,
+and the counts on stdout.
+
+Each command that changes a route prints the route as it is afterwards, in the shape of
+`show`. All these commands open the device. A command that keeps a route (`keep`, and
+`set --keep`) needs a record to hold it. When no site is active and the device is not
+fixed, the command fails with `1`, and nothing is written. Its sentence names
+`meshterm outbound use <site>`.
+
+`list` returns `5` when no contact has a route. `unkeep` returns `5` when no route was kept.
+`discover` returns `5` when no answer comes. A bad `SPEC`, a route that the radio cannot
+hold, and a contact that does not exist are usage errors (`2`). `keep` with no `--path`
+is also a usage error when the radio has no route to keep.
+
+**`--json`** gives `list` as an array, and each other command as one object. They have
+these fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `node` | object | The contact: the shared node object. |
+| `path` | string \| null | The route in the radio, as a spec. `""` is no relay. `null` is no route. |
+| `origin` | string | `kept`, `set`, `learned`, or `flood`. |
+| `kept` | string \| null | The route that you keep, as a spec. `null` when you keep none. |
+| `kept_by` | object \| null | `{"source": "site" or "device", "name": …}`. `null` when you keep no route. `show` only. |
+| `kept_in_radio` | boolean \| null | Whether the radio holds the kept route. `show` only. |
+| `skipped` | boolean \| null | Whether the kept route is not written because its first hop is silent. `show` only. |
+| `first_hop_heard_at` | string \| null | When MeshTerm last heard that first hop (UTC). `show` only. |
+| `route` | array \| null | The nodes from your node to the contact, each as a node object. `null` when there is no route. |
+
+`discover` gives `node`, `answered`, `out_path`, `in_path`, `used`, `out_route`, and
+`in_route`. Each is `null` when no answer came. `sync` gives `site` (the active site, or
+`null`), `saved` (an array of `{"site", "routes"}`), `restored`, `kept_written`,
+`kept_skipped` (the names of the contacts), and `failed` (the names of the contacts that the
+radio refused).
 
 #### `meshterm tx-optimize`
 
@@ -1629,13 +1845,16 @@ row has no column here, because `optimal_tx_dbm` names the winner.
 
 If no password is available and MeshTerm cannot ask for one, this is a **usage error**
 (`2`), and nothing was transmitted. If the node refuses the password, this is a device
-error (`4`), and MeshTerm clears the saved password. The command returns `5` when no
+error (`4`), and MeshTerm clears the saved password. A stock node does not answer a wrong
+password. Thus, if the owner of the node changed its password, the login gets no reply, and
+the command fails with `4`. Then give the new password one time with `--password`: a
+password that the node accepts replaces the saved one. The command returns `5` when no
 trace reached the target at any level. In this case MeshTerm measured nothing, and the
 node stays at its original power.
 
 ---
 
-### Other nodes
+### Managed nodes
 
 #### `meshterm repeater-admin`
 
@@ -1661,9 +1880,12 @@ with the echoed prompt. A node that does not answer is not a failure, because th
 can have arrived. But there is nothing to report, so the command returns `5`.
 
 MeshTerm logs in automatically with the remembered password. To store a password, run
-the interactive flow one time, or give `--password`. If the node refuses the login,
-MeshTerm clears the saved password, and the command fails with `4`. The node answered,
-and the answer was no. A password that is **absent**, and a node name that no contact
+the interactive flow one time, or give `--password`. A password that the node accepts
+replaces the remembered one. A stock node does not answer a wrong password. Thus, after the
+owner of the node changes its password, the login gets no reply, and the command fails with
+`4`. Then give the new password one time with `--password`. If the node refuses the login
+(firmware other than stock MeshCore can do this), MeshTerm clears the saved password, and
+the command fails with `4`. A password that is **absent**, and a node name that no contact
 matches, are usage errors (`2`). In both cases nothing was transmitted. This is the line
 between these errors and the errors `3` and `4`.
 
@@ -1717,6 +1939,42 @@ is known to be something other than a repeater.
 ```
 
 `regions` never holds the wildcard `*`. That is `unscoped`, because it names no region.
+
+#### `meshterm forget-admin-passwords`
+
+Forget all the admin passwords that MeshTerm remembers.
+
+```
+meshterm forget-admin-passwords --yes
+```
+
+| Option | What it does |
+| --- | --- |
+| `--yes` | **Required.** Confirm the deletion. Without it, the command is a usage error (`2`) and forgets nothing. |
+
+```console
+$ meshterm forget-admin-passwords --yes
+NAME           LAST_LOGIN  KEY
+Yagi-Repeater          2d  a1b2c3d400000000000000000000000000000000000000000000000000000000
+```
+
+The command lists the nodes whose passwords it forgot, with the time of the last good
+login to each node. It also forgets the password of a node that is not a contact any more.
+After this command, a login to each node needs its password again: give it with
+`--password`, or type it in the prompt of the menu. You cannot undo this command. The
+command sends nothing, and it works with no device connected. It returns `5` when MeshTerm
+remembered no password.
+
+To forget the password of one node, press Del on that node in the node picker of the menu.
+
+**`--json`** is an array, with one object for each node:
+
+```json
+[{"node":{"name":"Yagi-Repeater","key":"a1b2c3d400000000000000000000000000000000000000000000000000000000","hash":null,"type":null,"place":null,"self":false},"last_login_at":"2026-11-02T06:51:52Z"}]
+```
+
+`hash`, `type`, and `place` are `null`, because MeshTerm keeps only the name and the key
+of a node with its password.
 
 ---
 
@@ -1813,7 +2071,7 @@ code beside each link. The scripted face prints only the link.
 **`--json`:**
 
 ```json
-{"page":"discord","title":"Join Discord","version":"0.11.5","text":"Join the Discord\n  Questions, ideas, bug reports, and mesh talk.\n\n  • https://discord.gg/AZwe5Uvb3S","links":["https://discord.gg/AZwe5Uvb3S"]}
+{"page":"discord","title":"Join Discord","version":"0.12.0","text":"Join the Discord\n  Questions, ideas, bug reports, and mesh talk.\n\n  • https://discord.gg/AZwe5Uvb3S","links":["https://discord.gg/AZwe5Uvb3S"]}
 ```
 
 | Field | Type | Meaning |
@@ -2093,14 +2351,14 @@ fi
 are about:
 
 ```bash
-meshterm trace-path --path "a1,d4" --json \
+meshterm trace-path --path "a1,b2" --json \
   | jq -r '.edges | min_by(.snr_db) | "\(.from.hash) -> \(.to.hash)  \(.snr_db) dB"'
 ```
 
 **A route as one line**, with our node, as the plain face draws it:
 
 ```bash
-meshterm trace-path --path "a1,d4,a1" --json \
+meshterm trace-path --path "a1,b2,a1" --json \
   | jq -r '.route | map(.name // .hash) | join(" -> ")'
 ```
 

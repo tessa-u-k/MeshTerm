@@ -19,26 +19,40 @@ starts with the name and ends with the key. These two lanes are what a contact *
 flexible widths are built around them. Each list declares the middle lanes that it wants as
 a tuple of :class:`ContactLane` (:data:`DEFAULT_LANES` for ``NAME · HEARD · PKTS · KEY``,
 :data:`TRACE_LANES` for the extra ``TRACED`` of the Trace picker, :data:`ARCHIVED_LANES` for
-the single ``ARCHIVED`` of the Archived list).
+the ``PLACE`` and ``ARCHIVED`` of the Archived list).
 
 A lane has its own sort ring id, header label, width, and the way to read its value from a
 row. Thus to add a lane is a declaration, not a branch: the header, the row builder, the
 sort metric, and the calculation of the lane widths all read the same tuple. The tuple
 replaces a ``show_traced`` flag. That flag had already caused three of those four places to
 say "and if it's the trace picker…".
+
+**A list can show every value in full.** The Contacts list and the Archived list pass
+``pan=True``. Their lanes then have the width of their content: the longest name, the
+longest place, and the full key. No value is cut to fit the terminal. A row that is wider
+than the terminal pans: ←→ slide the column header and all the rows by one shared shift,
+with the mark column and the name held still (refer to
+:attr:`~meshterm.ui.tui.select.Choice.pans`). The other lists can be floating dialogs (the
+Trace picker), so they keep the lanes that fit the terminal.
+
+**A list with the** ``PLACE`` **lane reads its places from the place service.** The caller
+gives the service (``places``), and the list fills the place of each row from the key of
+the row. The service counts its changes. When a place arrives while the list is open, the
+next paint fills the rows again, and the highlight, the sort, the filter, and the pan stay.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.cells import cell_len
 from rich.text import Text
 
-from .marks import LOCK_ICON, SELF_MARK
+from .marks import LOCK_ICON, MANAGED_ICON, SELF_MARK
 from .menus import fit_cells
 from .theme import glyph, name_style
 from .tui.select import Choice, SelectScreen, Separator
@@ -51,6 +65,9 @@ from .widgets import (
     format_age,
     highlighted_hash,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..services.places import PlaceService
 
 #: The minimum width of the name lane (on a very narrow terminal), so that the ``NAME``
 #: label of the header and its sort triangle always have space.
@@ -97,8 +114,10 @@ class ContactLane:
         width: The field width of the lane in cells. The values align to the right in it.
         field: The :class:`ContactRow` attribute that holds the value of the lane.
         kind: ``"age"`` for a datetime drawn as a relative age in the colour of the
-            recency heat, or ``"count"`` for an integer count drawn muted (a faint ``—``
-            when ``None``).
+            recency heat, ``"count"`` for an integer count drawn muted (a faint ``—``
+            when ``None``), or ``"text"`` for a string drawn on the left (a faint ``—``
+            when ``None``). A ``text`` lane has no fixed width: the list sizes it to its
+            widest value (refer to :func:`_sized`), and :attr:`width` is the minimum.
     """
 
     column: str
@@ -117,44 +136,57 @@ PKTS_LANE = ContactLane("packets", "PKTS", 5, "count", kind="count")
 #: How long ago the node was last traced: the extra lane of the Trace-target picker.
 TRACED_LANE = ContactLane("traced", "TRACED", 6, "last_traced")
 
-#: How long ago the contact was archived and removed from the device: the only lane of the
+#: How long ago the contact was archived and removed from the device: the last lane of the
 #: Archived list. It is drawn exactly as ``HEARD`` is, with the recency heat. It is the same
 #: question (how long ago did this occur) about a different event. A visual language of its
 #: own is a second grammar that the user must learn, with no benefit.
 ARCHIVED_LANE = ContactLane("archived", "ARCHIVED", 8, "archived_at")
 
+#: The place of the node: the named area nearest its location (refer to
+#: :class:`~meshterm.core.places.Place`). It is text, so the list sizes it to its widest value.
+#: On the Contacts screen it is the last lane, so it is immediately before the key. On the
+#: Archived list it is the first lane, after the name (JP, 2026-11-03).
+PLACE_LANE = ContactLane("place", "PLACE", 5, "place", kind="text")
+
 #: The middle lanes of the usual contact list: ``NAME · HEARD · PKTS · KEY``.
 DEFAULT_LANES: tuple[ContactLane, ...] = (HEARD_LANE, PKTS_LANE)
+
+#: The middle lanes of the Contacts screen: ``NAME · HEARD · PKTS · PLACE · KEY``.
+CONTACTS_LANES: tuple[ContactLane, ...] = (HEARD_LANE, PKTS_LANE, PLACE_LANE)
 
 #: The middle lanes of the Trace-target picker, which puts ``TRACED`` before the usual two.
 TRACE_LANES: tuple[ContactLane, ...] = (TRACED_LANE, HEARD_LANE, PKTS_LANE)
 
-#: The middle lanes of the Archived list: ``NAME · ARCHIVED · KEY``. There is no ``HEARD``
-#: and no ``PKTS``. An archived contact is not on the device, so this screen is not about
-#: what the contact still transmits. It is about when the contact left.
-ARCHIVED_LANES: tuple[ContactLane, ...] = (ARCHIVED_LANE,)
+#: The middle lanes of the Archived list: ``NAME · PLACE · ARCHIVED · KEY``. There is no
+#: ``HEARD`` and no ``PKTS``. An archived contact is not on the device, so this screen is not
+#: about what the contact still transmits. It is about where the contact is, and when it
+#: left. The ``PLACE`` lane is the same as on the Contacts screen.
+ARCHIVED_LANES: tuple[ContactLane, ...] = (PLACE_LANE, ARCHIVED_LANE)
+
+
+def _row_marks(row: ContactRow) -> str:
+    """The marks of a row before its type glyph: the padlock, then the key of a managed node."""
+    return (glyph(LOCK_ICON) if row.locked else "") + (glyph(MANAGED_ICON) if row.managed else "")
 
 
 def _lock_lane_width(rows: list[ContactRow]) -> int:
-    """The width of the lock column in cells: the platform padlock and its gap, or ``0``.
+    """The width of the mark column in cells: the widest marks of a row and a gap, or ``0``.
 
-    The column is on the left of the type glyph. It is there only while a row is locked, so
-    a list with no locks uses no cells for it. On the 53 cells of the PicoCalc, those cells
-    are for a name.
+    The column is on the left of the type glyph. It holds the padlock of a locked contact
+    and the key of a managed node (:func:`_row_marks`). It is there only while a row has a
+    mark, so a list with no marks uses no cells for it. On the 53 cells of the PicoCalc,
+    those cells are for a name.
     """
-    if not any(row.locked for row in rows):
-        return 0
-    return cell_len(glyph(LOCK_ICON)) + 1
+    widest = max((cell_len(_row_marks(row)) for row in rows), default=0)
+    return widest + 1 if widest else 0
 
 
 def _lock_cell(row: ContactRow, lock_w: int) -> str:
-    """The lock column of a row: the padlock and its gap when locked, or else blanks."""
+    """The mark column of a row: its marks and the gap, or else blanks."""
     if not lock_w:
         return ""
-    if not row.locked:
-        return " " * lock_w
-    mark = glyph(LOCK_ICON)
-    return mark + " " * (lock_w - cell_len(mark))
+    marks = _row_marks(row)
+    return marks + " " * (lock_w - cell_len(marks))
 
 
 #: The muted ``(you)`` tag on the lane of our node (refer to :func:`_lane`). Its width is part
@@ -197,13 +229,16 @@ TRACE_SORT_OPENS_ASCENDING: dict[str, bool] = {
     "hash": True,
 }
 
-#: The sort ring of the Archived list: ``NAME · ARCHIVED · KEY``, the same as
+#: The sort ring of the Archived list: ``NAME · PLACE · ARCHIVED · KEY``, the same as
 #: :data:`ARCHIVED_LANES`. ``archived`` opens *ascending* on the age of the lane, so the
 #: most recently archived contacts come first. This screen answers the question "what did
-#: that sweep just take?", and the answer must be at the top of the screen.
-ARCHIVED_SORT_COLUMNS: tuple[str, ...] = ("name", "archived", "hash")
+#: that sweep just take?", and the answer must be at the top of the screen. ``place`` sorts
+#: as on the Contacts screen (refer to
+#: :data:`~meshterm.ui.widgets.CONTACTS_SORT_OPENS_ASCENDING`).
+ARCHIVED_SORT_COLUMNS: tuple[str, ...] = ("name", "place", "archived", "hash")
 ARCHIVED_SORT_OPENS_ASCENDING: dict[str, bool] = {
     "name": True,
+    "place": True,
     "archived": True,
     "hash": True,
 }
@@ -245,12 +280,17 @@ class ContactRow:
         last_traced: When this node was last traced (aware UTC). It fills the ``TRACED``
             lane (:data:`TRACE_LANES`), in the colour of the recency heat. ``None`` shows
             ``never``. Lists that do not declare the lane ignore it.
+        place: The place of the node, as its full label (``Villeray, Montréal``). It fills
+            the ``PLACE`` lane (:data:`PLACE_LANE`). ``None`` or blank renders a faint ``—``.
+            Lists that do not declare the lane ignore it.
         archived_at: When this contact was archived and removed from the device (aware
             UTC). It fills the ``ARCHIVED`` lane (:data:`ARCHIVED_LANES`). Lists without
             that lane ignore it.
         locked: Whether the contact is locked, so that it cannot be archived. A padlock
             then starts the row, on the left of the type glyph. ``False`` draws nothing
             there.
+        managed: Whether the contact is a managed node: MeshTerm stores its admin
+            password. The ``🔑`` then goes in the same column, after a padlock.
         you: Whether this is our node. Our node gets the ``★`` marker, the pure-white
             ``you`` name style with a muted ``(you)`` tag, and faint ``—`` heard and packet
             lanes (MeshTerm never hears our node). Its row is pinned above the sorted
@@ -265,7 +305,9 @@ class ContactRow:
     count: int | None = None
     last_traced: datetime | None = None
     archived_at: datetime | None = None
+    place: str | None = None
     locked: bool = False
+    managed: bool = False
     you: bool = False
 
 
@@ -318,10 +360,40 @@ def _header(
     for lane in lanes:
         # A label aligned to the right, above a value aligned to the right. Thus the header
         # of a narrow field is where its digits will be (``PKTS`` above a 5-cell count), not
-        # to the left of them.
-        column(header, f"{lane.label:>{lane.width}}", lane.column, lane.width)
+        # to the left of them. A text lane is the other way: on the left, as its values are.
+        # Its label is not padded, so the triangle comes directly after the word, as for
+        # ``NAME``. A padded label put the triangle at the far end of a wide lane, where the
+        # user did not see it, or past the edge of the screen.
+        if lane.kind == "text":
+            column(header, lane.label, lane.column, lane.width)
+        else:
+            column(header, f"{lane.label:>{lane.width}}", lane.column, lane.width)
     column(header, "KEY", "hash", 3, last=True)
     return header
+
+
+def _pad_cells(text: str, width: int) -> str:
+    """Return ``text`` padded on the right with spaces to ``width`` cells (a wide glyph is two)."""
+    return text + " " * max(0, width - cell_len(text))
+
+
+def _sized(lanes: tuple[ContactLane, ...], rows: list[ContactRow]) -> tuple[ContactLane, ...]:
+    """Return ``lanes`` with each ``text`` lane as wide as its widest value.
+
+    A text lane cannot have a fixed width, because no width fits every place name. The list
+    measures its rows, so that no value is cut. A lane is never narrower than its label. The
+    other lanes are the same objects.
+    """
+    sized = []
+    for lane in lanes:
+        if lane.kind == "text":
+            widest = max(
+                (cell_len(str(getattr(row, lane.field, None) or "")) for row in rows),
+                default=0,
+            )
+            lane = dataclasses.replace(lane, width=max(lane.width, cell_len(lane.label), widest))
+        sized.append(lane)
+    return tuple(sized)
 
 
 def _lane_cell(row: ContactRow, lane: ContactLane) -> Text:
@@ -331,9 +403,14 @@ def _lane_cell(row: ContactRow, lane: ContactLane) -> Text:
     colour of the recency heat. Thus a new value is bright and an old value is grey, the
     same for each event that the lane measures. A ``count`` lane draws the count muted, or
     a faint ``—`` where there is nothing to count. It clamps the count, so that a very
-    large count cannot make the column wider.
+    large count cannot make the column wider. A ``text`` lane draws its string on the left,
+    padded to the lane, or a faint ``—`` where there is none.
     """
     value = getattr(row, lane.field, None)
+    if lane.kind == "text":
+        if not value:
+            return Text(_pad_cells("—", lane.width), style="faint")
+        return Text(_pad_cells(str(value), lane.width))
     if lane.kind == "count":
         if value is None:
             return Text(f"{'—':>{lane.width}}", style="faint")
@@ -358,7 +435,8 @@ def _you_lane(
     longer than any lane, so it shows as many digits as fit, and then an ellipsis. **Each
     middle lane shows a faint ``—``**, whatever lanes the list declares. MeshTerm never
     hears, traces, or archives our node, so no middle lane has a value to show, and
-    each lane says so in the same way.
+    each lane says so in the same way. The one exception is a ``text`` lane (the place), which
+    shows its value when the row has one.
     """
     text = Text(" " * lock_w, no_wrap=True, overflow="ellipsis")  # our node is never locked
     text.append(SELF_MARK[0], style=SELF_MARK[1])
@@ -377,7 +455,11 @@ def _you_lane(
         text.append(fit_cells(row.name or "you", name_w), style="you")
     for lane in lanes:
         text.append(_GAP_S)
-        text.append(f"{'—':>{lane.width}}", style="faint")
+        if lane.kind == "text":
+            # The place of our node is a fact about where it is, and MeshTerm can know it.
+            text.append_text(_lane_cell(row, lane))
+        else:
+            text.append(f"{'—':>{lane.width}}", style="faint")
     text.append(_GAP_S)  # the same gap as before KEY in the header (refer to _header)
     if row.key:
         text.append_text(highlighted_hash(row.key, prefix_bytes, width=hash_w))
@@ -481,6 +563,10 @@ def _ordered(
             # stays.
             return 0
         value = getattr(row, lane.field, None)
+        if lane.kind == "text":
+            # A blank value sorts after each text (its first key is larger), like the nodes
+            # that were never heard in an age column.
+            return (0, str(value).casefold()) if value else (1, "")
         if lane.kind == "count":
             return value or 0
         secs = age_seconds(value)
@@ -499,8 +585,8 @@ class ContactListScreen(SelectScreen):
     other rows in the active sort order. ``lanes`` selects the set: :data:`DEFAULT_LANES`
     for the usual ``NAME · HEARD · PKTS · KEY``, :data:`TRACE_LANES` for the extra
     ``TRACED`` of the Trace picker, and :data:`ARCHIVED_LANES` for the
-    ``NAME · ARCHIVED · KEY`` of the Archived list. Give the set a ``sort`` whose ring
-    covers it.
+    ``NAME · PLACE · ARCHIVED · KEY`` of the Archived list. Give the set a ``sort`` whose
+    ring covers it.
 
     The lanes stay at the left. The name lane has the width of its widest name (not of the
     terminal). Thus the columns do not move when the window becomes wider, and the free
@@ -518,9 +604,18 @@ class ContactListScreen(SelectScreen):
     This is the same :class:`~meshterm.ui.widgets.ContactsSort` model and white column cue
     that the static Contacts table uses. Only the keyboard keys are different, because a
     list with a filter already uses the plain arrow keys.
+
+    With ``pan=True`` the list cuts no value (refer to the module docstring). Its rows and
+    its column header are one table that ←→ pan, with the marks and the name held still.
     """
 
     floating = False
+
+    #: The hint sheds this atom first when it is too wide (refer to
+    #: :func:`~meshterm.ui.tui.frame.fit_hint`). The ``Left`` and ``Right`` keys are the
+    #: first thing that a user tries on a row that runs past the edge, and the other atoms
+    #: name keys that nothing else shows. Only a list that pans has the atom.
+    spare_hint_atoms = ("←→ scroll",)
 
     @property
     def picocalc_lyra_lane(self):
@@ -566,6 +661,8 @@ class ContactListScreen(SelectScreen):
         footer_hint: str = _HINT,
         lanes: tuple[ContactLane, ...] = DEFAULT_LANES,
         key_hint: Callable[[Any], str] | None = None,
+        pan: bool = False,
+        places: PlaceService | None = None,
     ) -> None:
         """Build the list over rows that are already resolved.
 
@@ -597,17 +694,37 @@ class ContactListScreen(SelectScreen):
             key_hint: The hint atoms for the shortcut keys that act on the highlighted row
                 (refer to :class:`~meshterm.ui.tui.select.SelectScreen`). ``None`` for a list
                 with no such keys.
+            pan: Whether the list shows each value in full. The lanes then have the width
+                of their content, and ←→ pan the table when it is wider than the terminal
+                (refer to the module docstring). It is off for a list that can float as a
+                dialog, because the width of a dialog comes from the width of its rows.
+            places: The places of the nodes, for a list whose ``lanes`` have the ``PLACE``
+                lane. The list fills the place of each row from its key, and fills them
+                again when the service counts a change (refer to :meth:`render_body`).
+                With ``None``, each row keeps the place that the caller gave it.
         """
+        self._places = places if PLACE_LANE in lanes else None
+        self._place_rev = self._places.revision if self._places is not None else 0
+        rows = self._with_places(rows)
         self._contact_rows = rows
         self._prefix_bytes = prefix_bytes
         self._sort = sort
-        self._lanes = tuple(lanes)
+        self._declared_lanes = tuple(lanes)
+        self._lanes = _sized(self._declared_lanes, rows)
+        self._pan_table = pan
+        #: The cells of the mark column, the type glyph, and the name: the head that stays
+        #: still while the table pans. The first paint finds the real value (refer to
+        #: :meth:`_pinned_head`).
+        self._anchor = 0
         self._lead = list(lead) if lead else []
         self._tail = list(tail) if tail else []
         # Temporary values until the first render finds the true width (refer to
         # render_body).
         self._name_w = _NAME_MIN
         self._hash_w = _HASH_MIN
+        if pan:
+            # A list that cuts nothing knows its lanes before the first paint.
+            self._name_w, self._hash_w = self._lane_widths(0)
         super().__init__(
             title,
             self._compose_items(),
@@ -625,12 +742,21 @@ class ContactListScreen(SelectScreen):
         whatever the sort.
         """
         items: list = list(self._lead)
+        # The text lanes are as wide as the widest value that the rows have now. A change of
+        # the rows (a place that was found) can make a lane wider.
+        self._lanes = _sized(self._declared_lanes, self._contact_rows)
         # The lane names come before the contacts as their landmark, so they stay pinned at
         # the top while the list scrolls. Thus the user can still read the columns of a row
-        # far down in the sort.
+        # far down in the sort. In a list that pans, the header pans with the rows, and it
+        # holds the same head still.
         lock_w = _lock_lane_width(self._contact_rows)
         items.append(
-            Separator(_header(self._name_w, self._sort, self._lanes, lock_w), heading=True)
+            Separator(
+                _header(self._name_w, self._sort, self._lanes, lock_w),
+                heading=True,
+                pans=self._pan_table,
+                hscroll_from=self._anchor,
+            )
         )
         pinned = [row for row in self._contact_rows if row.you]
         rest = [row for row in self._contact_rows if not row.you]
@@ -646,6 +772,8 @@ class ContactListScreen(SelectScreen):
                         lock_w,
                     ),
                     row.value,
+                    pans=self._pan_table,
+                    hscroll_from=self._anchor,
                 )
             )
         items.extend(self._tail)
@@ -670,8 +798,25 @@ class ContactListScreen(SelectScreen):
         Args:
             rows: The lane data of each contact, as :meth:`__init__` accepts it.
         """
-        self._contact_rows = rows
+        self._contact_rows = self._with_places(rows)
         self._rebuild()
+
+    def _with_places(self, rows: list[ContactRow]) -> list[ContactRow]:
+        """The rows with the place of each node from the place service, if the list has one.
+
+        The key of the row finds the place. A row without a full key uses the key prefix of
+        its contact. A node with no known place gets ``None``, and its lane shows a faint
+        ``—``.
+        """
+        if self._places is None:
+            return rows
+        filled = []
+        for row in rows:
+            key = row.key or getattr(row.value, "key_prefix", None)
+            place = self._places.get(key) if key else None
+            label = (place.label or None) if place is not None else None
+            filled.append(dataclasses.replace(row, place=label))
+        return filled
 
     def _rebuild(self) -> None:
         """Rebuild the rows for the current sort and width, with the highlight on its contact."""
@@ -720,22 +865,51 @@ class ContactListScreen(SelectScreen):
 
         Each declared lane adds its width and gap to the fixed lead. Thus a list without
         two of the lanes (the Archived list) gives both widths back to the key.
+
+        A list that pans cuts nothing. Its name lane is the widest name, and its key lane is
+        the longest key, whatever the width of the terminal.
         """
+        if self._pan_table:
+            keys = (len(row.key.lower().removeprefix("0x")) for row in self._contact_rows)
+            return self._widest_name(), max(_HASH_MIN, *keys, 0)
         lead = (
             _LEAD
             + _lock_lane_width(self._contact_rows)
-            + sum(_GAP + lane.width for lane in self._lanes)
+            + sum(_GAP + lane.width for lane in _sized(self._declared_lanes, self._contact_rows))
         )
         name_cap = max(_NAME_MIN, width - lead - _HASH_MIN)
         name_w = max(_NAME_MIN, min(self._widest_name(), name_cap))
         hash_w = max(_HASH_MIN, width - lead - name_w)
         return name_w, hash_w
 
+    def _pinned_head(self, name_w: int, width: int) -> int:
+        """The cells of a row that stay still while the table pans, for a terminal ``width`` wide.
+
+        The head is the mark column, the type glyph with its space, and the name. They tell
+        the user which contact a row is, so they must not slide away. But a very long name
+        could leave no room for the lanes that slide. The head is never more than half of
+        the row area. The rest of such a name slides with the lanes, and no cell is lost.
+        """
+        if not self._pan_table:
+            return 0
+        head = _lock_lane_width(self._contact_rows) + 2 + name_w
+        return min(head, max(0, (width - 2) // 2))
+
     def render_body(self, width: int) -> list[str]:
-        """Size the name lane to its content and adjust the key lane, then render the list."""
+        """Size the name lane to its content and adjust the key lane, then render the list.
+
+        First, read the places again if the finder or the user changed one. The finder
+        works in the background, and a place can arrive while this screen is open. The
+        service counts its changes, so the list reads again only after a change. The
+        highlight, the sort, the filter, and the pan stay (refer to :meth:`update_rows`).
+        """
+        if self._places is not None and self._places.revision != self._place_rev:
+            self._place_rev = self._places.revision
+            self.update_rows(self._contact_rows)
         name_w, hash_w = self._lane_widths(width)
-        if (name_w, hash_w) != (self._name_w, self._hash_w):
-            self._name_w, self._hash_w = name_w, hash_w
+        anchor = self._pinned_head(name_w, width)
+        if (name_w, hash_w, anchor) != (self._name_w, self._hash_w, self._anchor):
+            self._name_w, self._hash_w, self._anchor = name_w, hash_w, anchor
             self._rebuild()
         return super().render_body(width)
 

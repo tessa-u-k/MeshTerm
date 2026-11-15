@@ -12,7 +12,7 @@ import sqlite3
 import statistics
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +29,7 @@ from ..core.models import (
     TxLevelResult,
     utcnow,
 )
+from ..core.places import Place
 from ..core.regions import SCOPED_ROUTES, raw_scope_body
 from ..core.secrets import loggable
 from . import db
@@ -83,8 +84,21 @@ _INSERT_OBSERVATION = (
     "INSERT INTO observations "
     "(run_id, node, public_key, name, kind, node_type, snr, rssi, lat, lon, path, "
     "observed_at, chan_hash, cipher_mac, crypted, payload_typename, dest, src, tag, "
-    "trace_snrs, route, transport_code, scope_body) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "trace_snrs, route, transport_code, scope_body, sent_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+#: The SQL form of :attr:`~meshterm.core.models.ChatMessage.arrived_at`: the best time on
+#: our clock for when a ``messages`` row came to us. The arrival time, if it is known. For a
+#: message that waited in the companion, the earlier of the sender time and the arrival
+#: time. For our own messages and the rows from before MeshTerm kept the arrival time,
+#: ``created_at``. Each query about our side (heard times, the order of conversations,
+#: channel activity) uses this, never ``created_at`` alone, because a node with a wrong
+#: clock writes a false ``created_at``. The two columns hold UTC ISO-8601 text, so the
+#: comparison of the text is a comparison of the times (to the second).
+_ARRIVED_AT = (
+    "COALESCE(CASE WHEN waited = 1 AND created_at < received_at "
+    "THEN created_at ELSE received_at END, created_at)"
 )
 
 
@@ -162,6 +176,16 @@ def _as_when(iso: Any) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    """Read a whole number from a raw payload, or return ``None`` when it is not one."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -1155,6 +1179,18 @@ class Repository:
         transport_code = raw.get("transport_code") if route in SCOPED_ROUTES else None
         body = raw_scope_body(raw) if route == "TC_FLOOD" and transport_code else None
         scope_body = body.hex() if body is not None else None
+        # The own time of an advert, by the clock of its sender. With ``observed_at`` (our
+        # clock), it gives the clock offset of the node (refer to
+        # :mod:`~meshterm.services.clock_offsets`). Zero is a clock that was never set,
+        # which is a reading too, but not a time: it stays NULL.
+        sent_at = None
+        if typename == "ADVERT":
+            stamp = _as_int_or_none(raw.get("adv_timestamp"))
+            if stamp:
+                try:
+                    sent_at = datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    sent_at = None
         return (
             run_id,
             obs.node,
@@ -1179,6 +1215,7 @@ class Repository:
             route,
             transport_code,
             scope_body,
+            sent_at,
         )
 
     def observation_count(self) -> int:
@@ -1341,6 +1378,42 @@ class Repository:
                 )
             )
         return observations
+
+    def node_type(self, node: str) -> int | None:
+        """The advert type that a node announced the last time MeshTerm heard it say one.
+
+        Trace target asks this for a node that is not a contact (the sender of a message),
+        because a node that does not relay changes the walk (refer to
+        :func:`~meshterm.core.models.relays_traces`).
+
+        Args:
+            node: The key of the node, or a prefix of it, in hex. Observations store the
+                first 12 hex digits. A shorter prefix can name more than one node. Then it
+                gives a type only when all these nodes announced the same type.
+
+        Returns:
+            The ``NODE_TYPE_*`` value, or ``None`` when no stored advert of the node has a
+            type, or when a short prefix names nodes of different types.
+        """
+        prefix = node.lower().removeprefix("0x")[:12]
+        if not prefix:
+            return None
+        # A range, not LIKE, so that the index on ``node`` finds the rows. Each hex digit
+        # sorts before "g".
+        span = (prefix, prefix + "g")
+        if len(prefix) < 12:
+            types = self._conn.execute(
+                "SELECT DISTINCT node_type FROM observations WHERE node >= ? AND node < ? "
+                "AND node_type IS NOT NULL LIMIT 2",
+                span,
+            ).fetchall()
+            return int(types[0]["node_type"]) if len(types) == 1 else None
+        row = self._conn.execute(
+            "SELECT node_type FROM observations WHERE node >= ? AND node < ? "
+            "AND node_type IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
+            span,
+        ).fetchone()
+        return int(row["node_type"]) if row is not None else None
 
     def node_observations(
         self, node: str, *, since: datetime | None = None, limit: int = 50000
@@ -2037,7 +2110,7 @@ class Repository:
         # -- direct messages: totals, our share, and the latest, matched by prefix ----
         dm_rows = self._conn.execute(
             "SELECT peer, COUNT(*) AS total, SUM(outbound) AS sent, "
-            "MAX(created_at) AS last FROM messages "
+            f"MAX({_ARRIVED_AT}) AS last FROM messages "
             "WHERE is_channel = 0 AND peer IS NOT NULL GROUP BY peer"
         ).fetchall()
 
@@ -2116,8 +2189,8 @@ class Repository:
         cur = self._conn.execute(
             "INSERT INTO messages "
             "(run_id, outbound, is_channel, channel_id, channel_idx, peer, peer_name, text, "
-            "snr, acked, created_at, scope, author) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "snr, acked, created_at, scope, author, received_at, waited) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 int(msg.outbound),
@@ -2132,6 +2205,8 @@ class Repository:
                 msg.created_at.isoformat(),
                 msg.scope,
                 msg.author.lower() if msg.author else None,
+                msg.received_at.isoformat() if msg.received_at else None,
+                int(msg.waited),
             ),
         )
         self._conn.commit()
@@ -2287,6 +2362,10 @@ class Repository:
 
         Outbound messages are not included: to send to a node is not to hear from it.
 
+        The time is the arrival time (:data:`_ARRIVED_AT`), not the sender time. The sender
+        time comes from the clock of the sender. When this method read it, one message from
+        a node whose clock was a year ahead showed that node as "heard now" for a year.
+
         Returns:
             The latest time of an inbound message, keyed by the stored peer prefix (in
             lowercase, as :meth:`record_chat_message` writes it), in aware UTC. The prefix
@@ -2294,10 +2373,108 @@ class Repository:
             match it as a prefix, not by equality.
         """
         rows = self._conn.execute(
-            "SELECT peer, MAX(created_at) AS last FROM messages "
+            f"SELECT peer, MAX({_ARRIVED_AT}) AS last FROM messages "
             "WHERE is_channel = 0 AND outbound = 0 AND peer IS NOT NULL GROUP BY peer"
         ).fetchall()
         return {row["peer"]: datetime.fromisoformat(row["last"]) for row in rows}
+
+    def advert_clock_samples(
+        self, *, since: datetime | None = None, node: str | None = None
+    ) -> list[tuple[str, datetime, datetime]]:
+        """The adverts that carry their own time: one clock sample for each.
+
+        Args:
+            since: Only the adverts heard at this time or later.
+            node: Only the adverts of this node (its 12-hex id).
+
+        Returns:
+            ``(node, sent_at, observed_at)`` for each advert, oldest first. ``sent_at`` is
+            the clock of the node, and ``observed_at`` is ours.
+        """
+        sql = "SELECT node, sent_at, observed_at FROM observations WHERE sent_at IS NOT NULL"
+        args: list[Any] = []
+        if node is not None:
+            sql += " AND node = ?"
+            args.append(node.lower()[:12])
+        if since is not None:
+            sql += " AND observed_at >= ?"
+            args.append(since.isoformat())
+        samples = []
+        for row in self._conn.execute(sql + " ORDER BY observed_at", args):
+            sent, heard = _as_when(row["sent_at"]), _as_when(row["observed_at"])
+            if row["node"] and sent is not None and heard is not None:
+                samples.append((row["node"], sent, heard))
+        return samples
+
+    def message_clock_samples(
+        self,
+        *,
+        since: datetime | None = None,
+        peer: str | None = None,
+        sender: str | None = None,
+    ) -> list[tuple[bool, str | None, str, datetime, datetime]]:
+        """The received messages with a known arrival time: one clock sample for each.
+
+        A message from the queue of the companion (``waited``) is not a sample, because its
+        arrival time is not known. A room post is not a sample either: its time is when its
+        author posted it, not when the room sent it. Our own messages have no sender clock.
+
+        Args:
+            since: Only the messages that arrived at this time or later.
+            peer: Only the direct messages of this key prefix (either one can be the
+                longer one).
+            sender: Only the channel messages whose ``Name: `` prefix is this name.
+
+        Returns:
+            ``(is_channel, peer, text, created_at, received_at)`` for each message, oldest
+            first. ``created_at`` is the sender time, and ``received_at`` is ours.
+        """
+        sql = (
+            "SELECT is_channel, peer, text, created_at, received_at FROM messages "
+            "WHERE outbound = 0 AND received_at IS NOT NULL AND waited = 0 AND author IS NULL"
+        )
+        args: list[Any] = []
+        if since is not None:
+            sql += " AND received_at >= ?"
+            args.append(since.isoformat())
+        if peer is not None:
+            key = peer.lower()
+            sql += (
+                " AND is_channel = 0 AND peer IS NOT NULL"
+                " AND (? LIKE peer || '%' OR peer LIKE ? || '%')"
+            )
+            args += [key, key]
+        if sender is not None:
+            prefix = f"{sender}:"
+            sql += " AND is_channel = 1 AND substr(text, 1, ?) = ?"
+            args += [len(prefix), prefix]
+        samples = []
+        for row in self._conn.execute(sql + " ORDER BY received_at", args):
+            sent, arrived = _as_when(row["created_at"]), _as_when(row["received_at"])
+            if sent is not None and arrived is not None:
+                samples.append((bool(row["is_channel"]), row["peer"], row["text"], sent, arrived))
+        return samples
+
+    def newest_room_post(self, peer: str) -> datetime | None:
+        """The time of the newest post that a room sent us, by the clock of the room.
+
+        The companion asks a room for each post newer than the newest post that it got, and
+        that time is close to this one (both are the highest post time seen). Thus, when the
+        clock of the room goes back past this time, the room never sends us its new posts
+        (refer to :func:`~meshterm.services.clock_offsets.room_posts_blocked`).
+
+        Args:
+            peer: The key prefix of the room, as :meth:`record_chat_message` stores it.
+
+        Returns:
+            The newest post time, or ``None`` when the room sent no post.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(created_at) AS newest FROM messages "
+            "WHERE is_channel = 0 AND outbound = 0 AND author IS NOT NULL AND peer = ?",
+            ((peer or "").lower(),),
+        ).fetchone()
+        return _as_when(row["newest"] if row else None)
 
     def direct_message_bounds(
         self, peer: str | None, when: datetime, *, outbound: bool
@@ -2325,9 +2502,14 @@ class Repository:
         version of this clamp gave a received message an empty window. In one direction,
         the stamps are consistent, so the neighbours mean what they say.
 
+        The times are arrival times (:data:`_ARRIVED_AT`). For a received message that has
+        one, our clock stamps it, as it stamps a send. The direction rule stays, because
+        each row from before MeshTerm kept the arrival time still has only the sender time.
+
         Args:
             peer: The key prefix of the contact, as :meth:`record_chat_message` stores it.
-            when: The time of the message.
+            when: The arrival time of the message
+                (:attr:`~meshterm.core.models.ChatMessage.arrived_at`).
             outbound: The direction in which to look: the direction of the message.
 
         Returns:
@@ -2338,14 +2520,14 @@ class Repository:
         key = (peer or "").lower()
         args = (key, int(outbound), when.isoformat())
         row = self._conn.execute(
-            "SELECT MAX(created_at) AS edge FROM messages "
-            "WHERE is_channel = 0 AND peer = ? AND outbound = ? AND created_at < ?",
+            f"SELECT MAX({_ARRIVED_AT}) AS edge FROM messages "
+            f"WHERE is_channel = 0 AND peer = ? AND outbound = ? AND {_ARRIVED_AT} < ?",
             args,
         ).fetchone()
         prev = _as_when(row["edge"] if row else None)
         row = self._conn.execute(
-            "SELECT MIN(created_at) AS edge FROM messages "
-            "WHERE is_channel = 0 AND peer = ? AND outbound = ? AND created_at > ?",
+            f"SELECT MIN({_ARRIVED_AT}) AS edge FROM messages "
+            f"WHERE is_channel = 0 AND peer = ? AND outbound = ? AND {_ARRIVED_AT} > ?",
             args,
         ).fetchone()
         return prev, _as_when(row["edge"] if row else None)
@@ -2364,9 +2546,9 @@ class Repository:
         timestamps of the window, and Python puts them in buckets (a few hours of
         messages, so the row set stays small).
 
-        The timestamps are compared as strings. ``utcnow().isoformat()`` writes each
-        ``created_at`` (a fixed-width UTC ISO-8601 form). Thus the lexicographic order is
-        the chronological order, and the window cutoff does not have to parse each row.
+        The timestamps are the arrival times (:data:`_ARRIVED_AT`), compared as strings.
+        Each is a UTC ISO-8601 form. Thus the lexicographic order is the chronological
+        order, and the window cutoff does not have to parse each row.
         Messages from before the history had identity keys (a ``NULL`` ``channel_id``:
         refer to :meth:`backfill_channel_ids`) have no channel to count under, and the
         method skips them.
@@ -2378,25 +2560,27 @@ class Repository:
         now = utcnow()
         cutoff = now - ACTIVITY_WINDOW
         bucket_span = ACTIVITY_WINDOW / ACTIVITY_BUCKETS
+        # The arrival times (_ARRIVED_AT), not the sender times. A sender with a wrong
+        # clock put its messages outside the window, or in the bucket of "now" for months.
         rows = self._conn.execute(
-            "SELECT channel_id, COUNT(*) AS total, MAX(created_at) AS last_at "
+            f"SELECT channel_id, COUNT(*) AS total, MAX({_ARRIVED_AT}) AS last_at "
             "FROM messages WHERE is_channel = 1 AND channel_id IS NOT NULL "
             "GROUP BY channel_id"
         ).fetchall()
 
         histograms: dict[str, list[int]] = {}
         recent_rows = self._conn.execute(
-            "SELECT channel_id, created_at FROM messages "
-            "WHERE is_channel = 1 AND channel_id IS NOT NULL AND created_at >= ?",
+            f"SELECT channel_id, {_ARRIVED_AT} AS arrived_at FROM messages "
+            f"WHERE is_channel = 1 AND channel_id IS NOT NULL AND {_ARRIVED_AT} >= ?",
             (cutoff.isoformat(),),
         ).fetchall()
         for row in recent_rows:
             try:
-                created_at = datetime.fromisoformat(row["created_at"])
+                arrived_at = datetime.fromisoformat(row["arrived_at"])
                 # Bucket by age, so that the histogram comes out newest first (bucket 0 has
                 # the current five minutes). This is the order that the sparkline widget
                 # expects.
-                idx = min(ACTIVITY_BUCKETS - 1, int((now - created_at) / bucket_span))
+                idx = min(ACTIVITY_BUCKETS - 1, int((now - arrived_at) / bucket_span))
             except (TypeError, ValueError):
                 continue  # a malformed or naive timestamp does not go in a bucket
             histogram = histograms.setdefault(row["channel_id"], [0] * ACTIVITY_BUCKETS)
@@ -2440,6 +2624,80 @@ class Repository:
             (r["chan_hash"], r["cipher_mac"], r["crypted"], r["first_at"], r["last_at"])
             for r in rows
         ]
+
+    def channel_messages_without_arrival(
+        self, channel_ids: Iterable[str]
+    ) -> list[tuple[int, str, str, str]]:
+        """Each received channel message from before MeshTerm kept the arrival time.
+
+        These rows have only the sender time. :mod:`~meshterm.services.arrival_backfill`
+        finds their arrival time in the packet log.
+
+        Args:
+            channel_ids: The identities of the channels to read.
+
+        Returns:
+            ``(row id, channel id, created_at, text)`` for each row, with the time as the
+            stored ISO 8601 text.
+        """
+        ids = sorted(set(channel_ids))
+        if not ids:
+            return []
+        marks = ", ".join("?" * len(ids))
+        rows = self._conn.execute(
+            "SELECT id, channel_id, created_at, text FROM messages "
+            "WHERE outbound = 0 AND is_channel = 1 AND received_at IS NULL "
+            f"AND channel_id IN ({marks})",
+            ids,
+        ).fetchall()
+        return [(r["id"], r["channel_id"], r["created_at"], r["text"]) for r in rows]
+
+    def set_arrival_times(self, arrivals: Iterable[tuple[int, str]]) -> int:
+        """Give old rows the arrival time that the packet log proves.
+
+        Only a row with no arrival time changes. Thus a second run, or a run at the same
+        time as a new message, changes nothing that it must not change.
+
+        Args:
+            arrivals: ``(row id, arrival time as ISO 8601 text)`` pairs.
+
+        Returns:
+            The number of rows that changed.
+        """
+        cur = self._conn.executemany(
+            "UPDATE messages SET received_at = ? WHERE id = ? AND received_at IS NULL",
+            [(when, row_id) for row_id, when in arrivals],
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def arrival_backfill_done(self) -> set[str]:
+        """The channels whose old messages :mod:`~meshterm.services.arrival_backfill` searched.
+
+        Returns:
+            The channel identities. The backfill does not search these again.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM app_state WHERE key = 'arrival_backfill'"
+        ).fetchone()
+        if row is None:
+            return set()
+        try:
+            return {str(cid) for cid in json.loads(row["value"])}
+        except (ValueError, TypeError):
+            return set()
+
+    def mark_arrival_backfill_done(self, channel_ids: Iterable[str]) -> None:
+        """Record the channels that the backfill searched (refer to :meth:`arrival_backfill_done`).
+
+        Args:
+            channel_ids: All the searched channels, the earlier ones included.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO app_state(key, value) VALUES ('arrival_backfill', ?)",
+            (json.dumps(sorted(set(channel_ids))),),
+        )
+        self._conn.commit()
 
     def message_texts(self) -> list[str]:
         """The text of each stored chat message, for the names that the channel guide tests.
@@ -2511,6 +2769,81 @@ class Repository:
         )
         self._conn.commit()
 
+    # -- places -----------------------------------------------------------------
+
+    def node_locations(self, *, since: str | None = None) -> dict[str, tuple[float, float, str]]:
+        """The newest location that each node advertised.
+
+        The background job of :mod:`meshterm.services.places` reads it to find the nodes
+        whose place it must find. With ``since``, the query reads only the newer rows, by
+        the ``observed_at`` index. Thus a job that asks each minute pays only for the rows
+        that arrived in that minute.
+
+        Args:
+            since: Read only the observations after this UTC ISO-8601 stamp.
+
+        Returns:
+            For each node: ``(lat, lon, observed_at)`` of its newest located observation.
+        """
+        sql = (
+            "SELECT node, lat, lon, observed_at FROM observations "
+            "WHERE node IS NOT NULL AND lat IS NOT NULL AND lon IS NOT NULL AND kind != 'packet'"
+        )
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND observed_at > ?"
+            params.append(since)
+        newest: dict[str, tuple[float, float, str]] = {}
+        for row in self._conn.execute(sql, params):
+            old = newest.get(row["node"])
+            if old is None or row["observed_at"] >= old[2]:
+                newest[row["node"]] = (row["lat"], row["lon"], row["observed_at"])
+        return newest
+
+    def node_places(self) -> dict[str, tuple[Place, float, float]]:
+        """Each stored place, with the location that it was found for.
+
+        Returns:
+            For each node id: ``(place, lat, lon)``.
+        """
+        rows = self._conn.execute(
+            "SELECT node, lat, lon, fine, coarse, peak, source FROM node_places"
+        ).fetchall()
+        return {
+            row["node"]: (
+                Place(row["fine"], row["coarse"], row["source"], peak=bool(row["peak"])),
+                row["lat"],
+                row["lon"],
+            )
+            for row in rows
+        }
+
+    def save_node_place(self, node: str, lat: float, lon: float, place: Place) -> None:
+        """Store the place of a node, found for this location (it replaces an older one).
+
+        Args:
+            node: The 12-hex id of the node.
+            lat: The latitude that the place was found for.
+            lon: The longitude that the place was found for.
+            place: The place (an empty place is a stored "nothing here").
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO node_places "
+            "(node, lat, lon, fine, coarse, peak, source, found_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                node,
+                lat,
+                lon,
+                place.fine,
+                place.coarse,
+                int(place.peak),
+                place.source,
+                utcnow().isoformat(),
+            ),
+        )
+        self._conn.commit()
+
     @staticmethod
     def _row_to_chat(row: sqlite3.Row) -> ChatMessage:
         """Rebuild a :class:`ChatMessage` from a ``messages`` row."""
@@ -2525,6 +2858,8 @@ class Repository:
             snr=row["snr"],
             acked=None if row["acked"] is None else bool(row["acked"]),
             created_at=datetime.fromisoformat(row["created_at"]),
+            received_at=_as_when(row["received_at"]) if "received_at" in row.keys() else None,
+            waited=bool(row["waited"]) if "waited" in row.keys() else False,
             row_id=row["id"],
             scope=row["scope"] if "scope" in row.keys() else None,
             author=row["author"] if "author" in row.keys() else None,

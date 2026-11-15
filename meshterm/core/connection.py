@@ -32,15 +32,17 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from . import transmit_gate
 from .channels import CHANNEL_SLOT_PROBE_CAP
-from .events import MeshEvent
+from .events import MeshEvent, RouteChange
 from .frames import frame_addressing, trace_link_snrs
 from .models import (
     NODE_TYPE_CHAT,
     NODE_TYPE_REPEATER,
     NODE_TYPE_ROOM,
+    ROUTE_MAX_BYTES,
     Ack,
     Contact,
     Delivery,
+    DiscoveredRoute,
     Hop,
     LoginResult,
     Message,
@@ -49,7 +51,10 @@ from .models import (
     RoomAccess,
     RoomLogin,
     TraceResult,
+    advert_gate,
     advert_time,
+    clock_tolerance_s,
+    relays_traces,
     utcnow,
 )
 from .privatekey import normalize as normalize_key
@@ -1330,6 +1335,54 @@ class Device(ABC):
         """
 
     @abstractmethod
+    async def accept_adverts_again(self, node: Contact) -> bool:
+        """Lower the stored advert time of a contact, so that the device hears its adverts again.
+
+        The firmware drops each advert that is not newer than the advert time that it stores
+        for the contact (a replay check). When a clock that was ahead is set correctly, the
+        stored time stays in the future, and the device ignores the node until the real
+        time passes it (refer to :attr:`~meshterm.core.models.Contact.adverts_refused_until`).
+        This method reads the contact record from the device, and writes it back with the
+        stored time lowered to our clock less the clock tolerance. Only that field changes:
+        the flags, the learned path, the name, and the position go back as the device has
+        them. The time is never zero, so the device still refuses a replay of an older
+        advert.
+
+        Args:
+            node: The contact. It must have a full public key.
+
+        Returns:
+            ``True`` when the method wrote the record. ``False`` when the stored time was not
+            in the future, so that there was nothing to change.
+
+        Raises:
+            ContactNotOnDeviceError: If the device has no contact with that key.
+            DeviceCommandError: If the contact has no full key, or the device refused the
+                write.
+        """
+
+    @abstractmethod
+    async def reset_room_sync(self, node: Contact) -> None:
+        """Make the next login to a room ask for all its posts again.
+
+        At a login, the device sends the time of the newest post that it got from the room
+        (``sync_since``), and the room sends only the posts after that time. When the clock
+        of the room goes back, its new posts are all older than that time, and the room
+        never sends them. The device sets ``sync_since`` to zero only for a *new* contact,
+        and no command changes it for a contact that it has. Thus this method reads the
+        contact record, removes the contact, and adds the same record back: the same
+        flags, path, name, position, and advert time, with ``sync_since`` at zero.
+
+        Args:
+            node: The room server. It must have a full public key.
+
+        Raises:
+            ContactNotOnDeviceError: If the device has no contact with that key.
+            DeviceCommandError: If the device refused the removal, or the add. After a
+                failed add the contact is not on the device. The message says so.
+        """
+
+    @abstractmethod
     async def get_tx_power(self) -> int | None:
         """Return the current TX power level, or ``None`` if it is not known."""
 
@@ -1358,7 +1411,10 @@ class Device(ABC):
             ``if not await device.admin_login(...)``. A caller that acts on the failure
             must tell :attr:`~LoginResult.REFUSED` (the node said no: the password is
             wrong) from :attr:`~LoginResult.NO_REPLY` (nothing came back: the password is
-            not proved correct, and not proved wrong).
+            not proved correct, and not proved wrong). A stock repeater or room server
+            never says no: it does not answer a wrong password. Thus a wrong password
+            is usually :attr:`~LoginResult.NO_REPLY` (refer to
+            :mod:`meshterm.ui.admin_login`).
         """
 
     @abstractmethod
@@ -1403,6 +1459,58 @@ class Device(ABC):
         Raises:
             ContactNotOnDeviceError: If the radio has no contact for the node.
             DeviceCommandError: If the radio refused for any other reason.
+        """
+
+    @abstractmethod
+    async def set_route(self, node: Contact, hops: tuple[str, ...]) -> tuple[str, ...]:
+        """Write the device route to ``node``, so that the radio sends to it on these hops.
+
+        The radio holds one route for each contact. It uses the route for each direct
+        message, login, request, and admin command to the contact. The radio replaces the
+        route each time that a path return gives it a new one. Thus a route that this method
+        writes stays only until the radio learns another one. The action is local (nothing
+        is transmitted).
+
+        The firmware writes a contact as one full record (the name, the flags, the location,
+        and the route). Thus the implementation reads the record that the radio has now,
+        and changes only the route in it. A record from an older read can contain old
+        values, and the write would put them back.
+
+        Each hop goes into the radio at the hash width that the radio uses now (its path
+        hash mode). A hop longer than the width is cut to the width.
+
+        Args:
+            node: The contact whose route to write.
+            hops: The relays, in order from us outward, as hex hashes or key prefixes. An
+                empty tuple means no relay: the radio sends direct to a neighbour.
+
+        Returns:
+            The hops as the radio holds them now, at its hash width.
+
+        Raises:
+            ContactNotOnDeviceError: If the radio has no contact for the node.
+            DeviceCommandError: If a hop is shorter than the hash width, if the route is
+                too long for the radio, or if the radio refused the write.
+        """
+
+    @abstractmethod
+    async def discover_route(self, node: Contact) -> DiscoveredRoute | None:
+        """Send one path discovery to ``node``, and get the route in each direction.
+
+        A path discovery is one flood request to the contact. The answer tells the route
+        on which the first copy reached the contact, and the route on which the first copy
+        of the answer came back. The radio does not change its device route for this
+        request. Thus the user can examine the routes before using one.
+
+        Args:
+            node: The contact to ask.
+
+        Returns:
+            The two routes, or ``None`` when no answer came before the timeout.
+
+        Raises:
+            ContactNotOnDeviceError: If the radio has no contact for the node.
+            DeviceCommandError: If the radio refused to send the request.
         """
 
     @abstractmethod
@@ -3353,6 +3461,7 @@ class MeshCoreDevice(Device):
                     lat=lat,
                     lon=lon,
                     route_hops=_contact_route(info),
+                    adverts_refused_until=advert_gate(info.get("last_advert")),
                 )
             )
         return contacts
@@ -3405,6 +3514,78 @@ class MeshCoreDevice(Device):
             raise DeviceCommandError(
                 f"couldn't remove {node.name} from the device: {reject_reason(result)}"
             )
+
+    async def accept_adverts_again(self, node: Contact) -> bool:  # noqa: D102 - inherited docstring
+        mc = self._require()
+        pub = self._node_pubkey(node)  # raises DeviceCommandError if it has no key
+        if len(pub) != 64:
+            raise DeviceCommandError(f"{node.name} is known only by a key prefix")
+        record = await self._contact_record(mc, pub)
+        if record is None:
+            raise ContactNotOnDeviceError(node)
+        lowered = int(utcnow().timestamp()) - clock_tolerance_s()
+        if int(record.get("last_advert") or 0) <= lowered:
+            return False
+        # A new read of the record, written back with only the advert time changed. The
+        # command of the firmware writes each field of the frame into the stored contact
+        # (``updateContactFromFrame``). Thus a field that MeshTerm made up (a flood route,
+        # zero flags) would erase what the device learned.
+        record = {**record, "last_advert": lowered}
+        result = await mc.commands.add_contact(record)
+        if result is None or getattr(result, "is_error", lambda: False)():
+            raise DeviceCommandError(
+                f"couldn't change the advert time of {node.name}: {reject_reason(result)}"
+            )
+        return True
+
+    async def reset_room_sync(self, node: Contact) -> None:  # noqa: D102 - inherited docstring
+        mc = self._require()
+        pub = self._node_pubkey(node)  # raises DeviceCommandError if it has no key
+        if len(pub) != 64:
+            raise DeviceCommandError(f"{node.name} is known only by a key prefix")
+        record = await self._contact_record(mc, pub)
+        if record is None:
+            raise ContactNotOnDeviceError(node)
+        result = await mc.commands.remove_contact(pub)
+        if result is not None and getattr(result, "is_error", lambda: False)():
+            if error_code(result) == _ERR_NOT_FOUND:
+                raise ContactNotOnDeviceError(node)
+            raise DeviceCommandError(
+                f"couldn't remove {node.name} from the device: {reject_reason(result)}"
+            )
+        # The same record goes back, as a new contact: the firmware gives a new contact a
+        # ``sync_since`` of zero. Two tries, because the contact is off the device between
+        # the two commands, and a lost reply must not leave it there.
+        reason = ""
+        for _attempt in range(2):
+            result = await mc.commands.add_contact(dict(record))
+            if result is not None and not getattr(result, "is_error", lambda: False)():
+                return
+            reason = reject_reason(result)
+        raise DeviceCommandError(
+            f"{node.name} was removed from the device but couldn't be added back ({reason}). "
+            "MeshTerm still remembers it: add it again from the Contacts list."
+        )
+
+    async def _contact_record(self, mc, pub: str) -> dict | None:  # noqa: ANN001
+        """The raw contact record that the device has for a full key, or ``None``.
+
+        The one-contact read comes first (``CMD_GET_CONTACT_BY_KEY``). A firmware that does
+        not have that command gets the full table read instead, which is slower but sure.
+        """
+        try:
+            event = await mc.commands.get_contact_by_key(bytes.fromhex(pub))
+        except Exception:  # noqa: BLE001 - an older library or firmware: read the table
+            event = None
+        payload = dict(getattr(event, "payload", None) or {}) if event is not None else {}
+        if event is not None and not getattr(event, "is_error", lambda: False)() and payload:
+            if str(payload.get("public_key", "")).lower() == pub:
+                return payload
+        table = await self._contacts_payload(mc)
+        for info in table.values():
+            if str((info or {}).get("public_key", "")).lower() == pub:
+                return dict(info)
+        return None
 
     async def get_tx_power(self) -> int | None:  # noqa: D102 - inherited docstring
         info = await self.get_self_info()
@@ -3463,6 +3644,79 @@ class MeshCoreDevice(Device):
                 f"couldn't reset the route to {node.name}: {reject_reason(result)}"
             )
 
+    async def set_route(  # noqa: D102 - inherited docstring
+        self, node: Contact, hops: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        mc = self._require()
+        pub = self._node_pubkey(node)  # raises DeviceCommandError if it has no key
+        if len(pub) != 64:
+            raise DeviceCommandError(f"{node.name} is known only by a key prefix")
+        mode = max(int(await self.get_path_hash_mode()), 0)
+        route = route_at_width(hops, mode + 1, name=node.name)
+        # A new read of the record, written back with only the route changed. The firmware
+        # writes each field of the frame into the stored contact, so an older record would
+        # put old values back (refer to accept_adverts_again).
+        record = await self._contact_record(mc, pub)
+        if record is None:
+            raise ContactNotOnDeviceError(node)
+        result = await mc.commands.change_contact_path(record, "".join(route), path_hash_mode=mode)
+        if result is None or getattr(result, "is_error", lambda: False)():
+            if error_code(result) == _ERR_NOT_FOUND:
+                raise ContactNotOnDeviceError(node)
+            raise DeviceCommandError(
+                f"couldn't set the route to {node.name}: {reject_reason(result)}"
+            )
+        _log.debug("device route to %s set to %s", node.name, ",".join(route) or "no relays")
+        return route
+
+    async def discover_route(  # noqa: D102 - inherited docstring
+        self, node: Contact
+    ) -> DiscoveredRoute | None:
+        transmit_gate.mark()
+        from meshcore import EventType
+
+        mc = self._require()
+        pub = self._node_pubkey(node)
+        loop = asyncio.get_running_loop()
+        answer: asyncio.Future = loop.create_future()
+
+        def on_answer(event) -> None:  # noqa: ANN001 - meshcore Event
+            payload = getattr(event, "payload", None) or {}
+            if str(payload.get("pubkey_pre") or "").lower() == pub[:12] and not answer.done():
+                answer.set_result(payload)
+
+        # Listen before the send, as for a login: the answer of a neighbour can arrive
+        # before the send returns.
+        subscription = mc.subscribe(EventType.PATH_RESPONSE, on_answer)
+        try:
+            send = getattr(mc.commands, "_send_path_discovery_raw", None)
+            async with self.transmitting():
+                if send is not None:
+                    result = await send(bytes.fromhex(pub))
+                else:  # pragma: no cover - an older library build
+                    result = await mc.commands.send_path_discovery(bytes.fromhex(pub))
+            if result is None or getattr(result, "is_error", lambda: False)():
+                if error_code(result) == _ERR_NOT_FOUND:
+                    raise ContactNotOnDeviceError(node)
+                raise DeviceCommandError(
+                    f"couldn't send a path discovery to {node.name}: {reject_reason(result)}"
+                )
+            # The request is a flood, and the answer is a flood. The wait is the same as
+            # for a direct message sent by flood (refer to :meth:`send_direct_message`).
+            payload = getattr(result, "payload", None) or {}
+            suggested = float(payload.get("suggested_timeout") or 0) / 1000.0
+            budget = suggested * 1.25 + trace_timeout(0)
+            try:
+                found = await asyncio.wait_for(asyncio.shield(answer), budget)
+            except asyncio.TimeoutError:
+                _log.debug("path discovery to %s: no answer in %.1fs", node.name, budget)
+                return None
+        finally:
+            subscription.unsubscribe()
+        return DiscoveredRoute(
+            out_hops=_discovered_hops(found, "out"), in_hops=_discovered_hops(found, "in")
+        )
+
     async def _login(self, node: Contact, password: str, *, what: str) -> _LoginExchange:
         """Run one login exchange with a remote node, and report how it ended.
 
@@ -3493,10 +3747,12 @@ class MeshCoreDevice(Device):
         # ``send_login_sync`` waits for LOGIN_SUCCESS and *only* LOGIN_SUCCESS, and it does
         # not start to wait until its own send has returned. Thus:
         #
-        # * It never waits for a refusal. (The firmware does send a refusal, as a
-        #   LOGIN_FAILED frame that the library parses and dispatches like any other
-        #   event.) The refusal times out exactly like a node that MeshTerm cannot reach.
-        #   Both types of failure came back as the same ``None``.
+        # * It never waits for a refusal. (The companion sends a refusal as a LOGIN_FAILED
+        #   frame, which the library parses and dispatches like any other event. The
+        #   companion sends it when a reply arrives that is not "OK". A stock repeater
+        #   sends no reply at all for a wrong password, but other firmware can refuse.)
+        #   The refusal times out exactly like a node that MeshTerm cannot reach. Both
+        #   types of failure came back as the same ``None``.
         # * A worse case, for a node that MeshTerm can reach with no problem: the send
         #   itself blocks until a MSG_SENT arrives. The library correlates that
         #   acknowledgement only by its event type. Thus a scheduled advert, a telemetry
@@ -3828,8 +4084,10 @@ class MeshCoreDevice(Device):
         else:
             # No forced path: build a path that ends at the target's own hash (with
             # any learned ``out_path`` repeaters before it), because a trace replies only
-            # when its destination is the last hop. It is ``None`` only when the contact
-            # is unknown, and then the trace runs without a path.
+            # when its destination is the last hop. A target that does not relay turns at
+            # its last learned repeater instead. It is ``None`` when the contact is
+            # unknown, or when it does not relay and has no learned repeater. Then the
+            # trace runs without a path.
             resolved = await self._trace_path_to_contact(mc, target)
             if resolved is not None:
                 path_bytes, flags = resolved
@@ -3925,6 +4183,11 @@ class MeshCoreDevice(Device):
           repeaters to mirror, so the outbound leg is the full path).
         * learned multi-hop route → ``[repeater…, destination, repeater… (reversed)]``.
 
+        A destination that does not relay (a companion, a room server, or a sensor, refer
+        to :func:`~meshterm.core.models.relays_traces`) stops the trace. Then the walk turns
+        at the last repeater of the learned route, and the destination is not in it. With
+        no learned repeater, there is no turn, and the function returns ``None``.
+
         Each hash is encoded again at the trace's own width (``1 << flags``, only
         1/2/4/8 bytes). This changes the routing width of a region (for example 3) to the
         widest value that the trace can represent (2). The firmware matches by hash
@@ -3935,8 +4198,8 @@ class MeshCoreDevice(Device):
             target: The contact name (not case-sensitive), or a key prefix.
 
         Returns:
-            ``(path_bytes, flags)`` to walk, or ``None`` only when the contact is
-            unknown or has no public key to address.
+            ``(path_bytes, flags)`` to walk, or ``None`` when the contact is unknown, has
+            no public key to address, or does not relay and has no learned repeater.
         """
         payload = await self._contacts_payload(mc)
         needle = target.casefold()
@@ -3968,6 +4231,11 @@ class MeshCoreDevice(Device):
                 route = bytes.fromhex(out_path)[: out_path_len * size]
                 repeaters = [route[i * size : i * size + trace_size] for i in range(out_path_len)]
             dest = bytes.fromhex(pub)[:trace_size]
+            if not relays_traces(_as_int(info.get("type", info.get("adv_type")))):
+                # The destination does not relay, so the walk turns at the last repeater.
+                if not repeaters:
+                    return None
+                dest, repeaters = repeaters[-1], repeaters[:-1]
             # The outbound leg always ends at the destination's own hash, so the
             # destination recognizes the trace and replies. The return leg mirrors the same
             # repeaters back to us, because nothing sends the packet back automatically.
@@ -3996,8 +4264,13 @@ class MeshCoreDevice(Device):
 
             return handler
 
+        # True while the pump empties the queue that the companion kept before we connected
+        # (refer to ``_message_pump``). A message from that queue arrived at an unknown time,
+        # so it is marked ``waited``.
+        backlog = [True]
+
         def message_handler(event) -> None:  # noqa: ANN001
-            msg = message_from_event(event)
+            msg = message_from_event(event, waited=backlog[0])
             if msg is not None:
                 on_event(MeshEvent.message_event(msg))
 
@@ -4037,6 +4310,17 @@ class MeshCoreDevice(Device):
         etype = getattr(EventType, "ACK", None)
         if etype is not None:
             subs.append(subscribe(etype, ack_handler))
+
+        # The radio says when a path return replaced its device route to a contact.
+        def route_handler(event) -> None:  # noqa: ANN001
+            payload = getattr(event, "payload", None) or {}
+            key = str(payload.get("public_key") or "").lower()
+            if key:
+                on_event(MeshEvent.route_event(RouteChange(key)))
+
+        etype = getattr(EventType, "PATH_UPDATE", None)
+        if etype is not None:
+            subs.append(subscribe(etype, route_handler))
         # Trace replies are not observations (the ``run_trace`` that sent the trace takes
         # them by tag). But a log line for each reply that arrives lets us diagnose a "no
         # reply". A reply logged here with no matching ``trace <tag>`` line means that the
@@ -4057,7 +4341,9 @@ class MeshCoreDevice(Device):
         # Do the pull of received messages ourselves (refer to ``_message_pump``). MeshCore
         # never pushes message bodies, so without this pull, a send works but nothing is
         # received.
-        stop_pump = self._message_pump(mc, subs, subscribe)
+        stop_pump = self._message_pump(
+            mc, subs, subscribe, on_backlog_done=lambda: backlog.__setitem__(0, False)
+        )
 
         def unsubscribe() -> None:
             stop_pump()
@@ -4071,7 +4357,9 @@ class MeshCoreDevice(Device):
 
         return unsubscribe
 
-    def _message_pump(self, mc, subs: list, subscribe) -> Unsubscribe:  # type: ignore[no-untyped-def]
+    def _message_pump(  # type: ignore[no-untyped-def]
+        self, mc, subs: list, subscribe, *, on_backlog_done: Callable[[], None] | None = None
+    ) -> Unsubscribe:
         """Pull the received messages from the companion continuously (the RX pull model).
 
         MeshCore does not push message bodies unsolicited. The device sends a
@@ -4091,11 +4379,20 @@ class MeshCoreDevice(Device):
         A lock serializes the drains, so the triggers that overlap never send concurrent
         ``get_msg`` commands.
 
+        The first drain is the **backlog**: the messages that the companion kept while no
+        app was connected. The companion gives no time of arrival with them, so their
+        arrival time is unknown. When the first drain ends, the pump calls
+        ``on_backlog_done``. Thus the handler marks only the messages of the backlog as
+        ``waited``. A message that arrives on the air during the first drain is also
+        marked. The cost is small: for such a message, only a sender time in the future
+        counts as a wrong clock.
+
         Args:
             mc: The connected ``MeshCore`` client.
             subs: The subscription list to which this method adds the ``MESSAGES_WAITING``
                 subscription (so it is torn down with the others).
             subscribe: The ``subscribe`` callable of the client.
+            on_backlog_done: Called one time, when the first drain ends.
 
         Returns:
             A callable with no arguments that stops the pump (its poll task and drains).
@@ -4123,6 +4420,13 @@ class MeshCoreDevice(Device):
         def schedule_drain(_event=None) -> None:  # noqa: ANN001 - MESSAGES_WAITING callback
             asyncio.ensure_future(drain())
 
+        async def drain_backlog() -> None:
+            try:
+                await drain()
+            finally:
+                if on_backlog_done is not None:
+                    on_backlog_done()
+
         async def poll_loop() -> None:
             while not stop.is_set():
                 try:
@@ -4133,7 +4437,8 @@ class MeshCoreDevice(Device):
         waiting = getattr(EventType, "MESSAGES_WAITING", None)
         if waiting is not None:
             subs.append(subscribe(waiting, schedule_drain))
-        schedule_drain()  # a first, immediate drain of all that is already in the queue
+        # A first, immediate drain of all that is already in the queue: the backlog.
+        asyncio.ensure_future(drain_backlog())
         poll_task = asyncio.ensure_future(poll_loop())
 
         def stop_pump() -> None:
@@ -4755,6 +5060,11 @@ class MockDevice(Device):
         # down. There, a login comes back NO_REPLY, and the remembered credential must
         # survive it.
         self._unreachable: set[str] = set()
+        # Nodes that answer a wrong password with a refusal. A stock repeater sends no reply
+        # for a wrong password (``handleLoginReq`` returns 0), so a wrong password gets
+        # NO_REPLY from the simulator by default, as on a real mesh (GitHub issue 28). Put
+        # the name of a contact here to walk the path of firmware that refuses.
+        self._refusing: set[str] = set()
         self._remote_tx: dict[str, int] = {}
         self._default_remote_tx = 20
         # The settings of each simulated repeater, as its CLI shows them. MeshTerm fills
@@ -4907,6 +5217,25 @@ class MockDevice(Device):
             raise ContactNotOnDeviceError(node)
         self._contacts = [c for c in self._contacts if self._mock_key(c) != key]
 
+    async def accept_adverts_again(self, node: Contact) -> bool:  # noqa: D102 - inherited docstring
+        await asyncio.sleep(0)
+        key = self._mock_key(node)
+        for i, contact in enumerate(self._contacts):
+            if self._mock_key(contact) == key:
+                if contact.adverts_refused_until is None:
+                    return False
+                self._contacts[i] = replace(contact, adverts_refused_until=None)
+                return True
+        raise ContactNotOnDeviceError(node)
+
+    async def reset_room_sync(self, node: Contact) -> None:  # noqa: D102 - inherited docstring
+        await asyncio.sleep(0)
+        # The simulator keeps no sync time. It refuses only a contact that it does not have,
+        # as the firmware does.
+        key = self._mock_key(node)
+        if key not in {self._mock_key(c) for c in self._contacts}:
+            raise ContactNotOnDeviceError(node)
+
     async def get_tx_power(self) -> int | None:  # noqa: D102 - inherited docstring
         return self._tx_power
 
@@ -4978,7 +5307,9 @@ class MockDevice(Device):
         if node.name in self._unreachable:
             return LoginResult.NO_REPLY  # simulates a node that is down or out of range
         if password != self._admin_password:
-            return LoginResult.REFUSED
+            # Stock firmware sends nothing for a wrong password, so the simulator does the
+            # same. A node in ``_refusing`` runs firmware that says no.
+            return LoginResult.REFUSED if node.name in self._refusing else LoginResult.NO_REPLY
         self._admin_sessions.add(self._mock_key(node))
         return LoginResult.ACCEPTED
 
@@ -4999,7 +5330,7 @@ class MockDevice(Device):
         if flood:
             # The answer to a flood brings a new route back with it, as on hardware.
             self._stale_routes.discard(room.name)
-            self._set_route(key, self._LEARNED_ROUTE)
+            self._set_route(key, self._LEARNED_ROUTE, learned=True)
         cfg = self._remote_config(room)
         if password == self._admin_password:
             access = RoomAccess.ADMIN
@@ -5028,11 +5359,45 @@ class MockDevice(Device):
     #: The route that the simulator "learns" from the answer to a flood: one hop, through Yagi.
     _LEARNED_ROUTE = ("a1b2c3d4",)
 
-    def _set_route(self, key: str, hops: tuple[str, ...] | None) -> None:
-        """Give the contact with ``key`` a learned route, or forget its route (``None``)."""
+    async def set_route(  # noqa: D102 - inherited docstring
+        self, node: Contact, hops: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        await asyncio.sleep(0)
+        route = route_at_width(hops, self._path_hash_mode + 1, name=node.name)
+        key = self._mock_key(node)
+        if not any(self._mock_key(c) == key for c in self._contacts):
+            raise ContactNotOnDeviceError(node)
+        self._set_route(key, route)
+        return route
+
+    async def discover_route(  # noqa: D102 - inherited docstring
+        self, node: Contact
+    ) -> DiscoveredRoute | None:
+        transmit_gate.mark()
+        async with self.transmitting():
+            await asyncio.sleep(0)
+        key = self._mock_key(node)
+        if not any(self._mock_key(c) == key for c in self._contacts):
+            raise ContactNotOnDeviceError(node)
+        if node.name in self._unreachable:
+            return None
+        route = route_at_width(self._LEARNED_ROUTE, self._path_hash_mode + 1, name=node.name)
+        return DiscoveredRoute(out_hops=route, in_hops=tuple(reversed(route)))
+
+    def _set_route(self, key: str, hops: tuple[str, ...] | None, *, learned: bool = False) -> None:
+        """Give the contact with ``key`` a route, or forget its route (``None``).
+
+        A route that the simulated radio *learned* from the answer to a flood is pushed to
+        the listeners as a route change, as the companion pushes ``PATH_UPDATE``.
+        """
         self._contacts = [
             replace(c, route_hops=hops) if self._mock_key(c) == key else c for c in self._contacts
         ]
+        if learned:
+            held = next((c for c in self._contacts if self._mock_key(c) == key), None)
+            full = (held.public_key if held is not None else "") or key
+            for listener in list(self._listeners):
+                listener(MeshEvent.route_event(RouteChange(full.lower())))
 
     def _push_room(self, room: Contact) -> None:
         """Start the catch-up of a room: the posts after our newest post, oldest first.
@@ -5623,6 +5988,42 @@ class MockDevice(Device):
         offset = (remote_tx - self.optimal_remote_tx) / span
         return 9.0 - 24.0 * (offset**2)
 
+    def _stops_trace(self, target: str, forced: list[str] | None) -> bool:
+        """Whether a simulated contact that does not relay is in the walk, so that it stops.
+
+        With a forced path, a hop stops the walk when it names a contact that does not
+        relay, and no contact that relays. (On the real mesh, a repeater with the same hash
+        relays the trace.) With no path, the device routes the trace as the real device
+        does (refer to :meth:`MeshCoreDevice._trace_path_to_contact`): for a target that
+        does not relay, the walk turns at the last relay of its learned route. Thus only
+        such a target with no learned relay stops it.
+
+        Args:
+            target: The target of the trace, as a name or a key prefix.
+            forced: The hops of the forced path, or ``None`` when the device routes.
+
+        Returns:
+            Whether the trace stops before it comes home.
+        """
+
+        def named(contact: Contact, token: str) -> bool:
+            key = (contact.public_key or contact.key_prefix or "").lower()
+            return bool(token) and key.startswith(token.strip().lower())
+
+        if forced is None:
+            needle = target.casefold()
+            return any(
+                not relays_traces(c.node_type)
+                and not c.route_hops
+                and (c.name.casefold() == needle or named(c, target))
+                for c in self._contacts
+            )
+        for token in forced:
+            matches = [c for c in self._contacts if named(c, token)]
+            if matches and not any(relays_traces(c.node_type) for c in matches):
+                return True
+        return False
+
     async def run_trace(  # noqa: D102 - inherited docstring
         self,
         target: str,
@@ -5635,6 +6036,12 @@ class MockDevice(Device):
         forced = [h for h in path.split(",") if h.strip()] if path else None
         # As on the real device: the path-hash width is the byte length of a forced hop.
         hash_bytes = len(bytes.fromhex(forced[0])) if forced else None
+        if self._stops_trace(target, forced):
+            # As on the real mesh: a node that does not relay ends the walk there, and
+            # nothing comes back (refer to relays_traces).
+            return TraceResult(
+                target=target, success=False, tx_power=self._tx_power, path_hash_bytes=hash_bytes
+            )
         depth = len(forced) if forced else self._rng.randint(1, 3)
         hops: list[Hop] = []
         for i in range(depth):
@@ -5838,7 +6245,7 @@ def packet_observation_from_event(event) -> Observation | None:  # noqa: ANN001
     )
 
 
-def message_from_event(event) -> Message | None:  # noqa: ANN001
+def message_from_event(event, *, waited: bool = False) -> Message | None:  # noqa: ANN001
     """Map a meshcore ``CONTACT_MSG_RECV`` or ``CHANNEL_MSG_RECV`` event into a message.
 
     Direct messages have a ``pubkey_prefix`` sender. Channel messages have a
@@ -5853,6 +6260,8 @@ def message_from_event(event) -> Message | None:  # noqa: ANN001
 
     Args:
         event: A meshcore message event (anything that has a ``payload`` mapping).
+        waited: Whether the message came out of the queue of the companion at connect
+            (refer to :attr:`~meshterm.core.models.Message.waited`).
 
     Returns:
         The parsed :class:`Message`, or ``None`` if the payload had no text body.
@@ -5876,6 +6285,7 @@ def message_from_event(event) -> Message | None:  # noqa: ANN001
         is_channel=is_channel,
         sender_timestamp=sender_ts,
         snr=_as_float(payload.get("SNR", payload.get("snr"))),
+        waited=waited,
         author=author,
         raw=payload,
     )
@@ -5905,6 +6315,61 @@ def _as_int(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def route_at_width(hops: Iterable[str], size: int, *, name: str = "") -> tuple[str, ...]:
+    """The hops of a device route at the hash width of the radio, ready to write.
+
+    Args:
+        hops: The relays, in order from us outward, as hex hashes or key prefixes.
+        size: The bytes of each hash in the radio (its path hash mode plus one).
+        name: The name of the contact, for the error text.
+
+    Returns:
+        Each hop cut to ``size`` bytes, in lowercase hex.
+
+    Raises:
+        DeviceCommandError: If a hop is not hex, if a hop is shorter than the width, or if
+            the route has more bytes than the radio can hold (:data:`ROUTE_MAX_BYTES`).
+    """
+    route: list[str] = []
+    for hop in hops:
+        text = str(hop).strip().lower().removeprefix("0x")
+        try:
+            bytes.fromhex(text)
+        except ValueError:
+            raise DeviceCommandError(f"{hop!r} is not a hop in hex") from None
+        if len(text) < size * 2:
+            raise DeviceCommandError(
+                f"hop {text} is shorter than the radio's {size}-byte path hash, so the "
+                f"route to {name or 'the contact'} can't name it"
+            )
+        route.append(text[: size * 2])
+    if len(route) * size > ROUTE_MAX_BYTES:
+        raise DeviceCommandError(
+            f"the route has {len(route)} hops, and the radio holds at most "
+            f"{ROUTE_MAX_BYTES // size} at its {size}-byte path hash"
+        )
+    return tuple(route)
+
+
+def _discovered_hops(payload: dict, which: str) -> tuple[str, ...]:
+    """One route of a path discovery answer, as one hex hash for each relay.
+
+    Args:
+        payload: The ``PATH_RESPONSE`` payload of the library.
+        which: ``"out"`` or ``"in"``.
+
+    Returns:
+        The relays in their order of travel, or an empty tuple for no relay (or for a
+        field that cannot be read).
+    """
+    count = _as_int(payload.get(f"{which}_path_len")) or 0
+    size = _as_int(payload.get(f"{which}_path_hash_len")) or 1
+    text = str(payload.get(f"{which}_path") or "").lower()
+    if count <= 0 or len(text) < count * size * 2:
+        return ()
+    return tuple(text[i * size * 2 : (i + 1) * size * 2] for i in range(count))
 
 
 def _contact_route(info: dict) -> tuple[str, ...] | None:

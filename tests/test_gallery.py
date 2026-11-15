@@ -219,6 +219,19 @@ def _dashboard_scoped(cols: int, rows: int) -> Screen:
     return screen
 
 
+class _GalleryPlaces:
+    """A stand-in for the place service: Alice is in a named area, and the rest are not."""
+
+    revision = 0
+
+    def get(self, node):  # noqa: ANN001, ANN202 - the shape of PlaceService.get
+        from meshterm.core.places import SOURCE_TILES, Place
+
+        return (
+            Place("Villeray", "Montréal", SOURCE_TILES) if (node or "").startswith("aaaa") else None
+        )
+
+
 def _contacts(cols: int, rows: int) -> Screen:
     sort = ContactsSort.from_name("name", SORT_COLUMNS, SORT_OPENS_ASCENDING)
     contacts = [
@@ -239,6 +252,11 @@ def _contacts(cols: int, rows: int) -> Screen:
         archived=12,
         locked=frozenset({"aa" * 32}),
         can_lock=True,
+        # The locked contact is also a managed node: the mark column then holds the
+        # padlock and the key, its widest form, on each platform.
+        managed=frozenset({"aa" * 32}),
+        # A place with an accent and a coarse part, the widest form of the PLACE lane.
+        places=_GalleryPlaces(),
     )
     screen.handle("down")
     return screen
@@ -1183,6 +1201,8 @@ def _message_paths(cols: int, rows: int) -> Screen:
         self_name="Homestead",
         summary="heard twice",
         source="Alice",
+        # As the chat opens it: Enter traces the selected route (the hint shows it).
+        can_trace=lambda arrival: True,
     )
 
 
@@ -1271,6 +1291,138 @@ def _path_composer(cols: int, rows: int) -> Screen:
         topology=topo,
         width_bytes=1,
         hops=["3d63c6429436", "f2c24f54551e"],
+    )
+
+
+def _outbound_env():  # noqa: ANN202 - a private type of the module under test
+    """The session values of the Outbound paths pages: two nodes, and one trace through both."""
+    from meshterm.persistence.repository import TracedPath
+    from meshterm.services.outbound import DeviceIdentity
+    from meshterm.ui.outbound_screen import _Env
+
+    hub = Contact(name="Hilltop-Repeater", public_key=_HUB_KEY, key_prefix="3d63c6429436")
+    far = Contact(name="Alice", public_key=_FAR_KEY, key_prefix="f2c24f54551e")
+    self_key = "aaaaaaaaaaaa" + "0" * 52
+    walk = TracedPath(when=utcnow(), hops=[("3d", 9.5), ("f2", -4.0), ("3d", -3.5), (None, 11.0)])
+    topo = build_topology(
+        self_id=self_key,
+        contacts=[hub, far],
+        trace_paths=[walk] * 1200,  # a count of four digits, the widest that the lane draws
+        packet_paths=[],
+        neighbour_links=[],
+    )
+    return _Env(DeviceIdentity(self_key, "Homestead"), [hub, far], topo, 1)
+
+
+def _outbound_store():  # noqa: ANN202
+    """Two sites (one with a name of the longest length) and a fixed device."""
+    from meshterm.core.outbound_store import OutboundStore
+
+    store = OutboundStore(Path(tempfile.mkdtemp(prefix="meshterm-gallery-outbound-")) / "o.json")
+    store.put_site("Home", [("3d63c6429436",), ("3d63c6429436", "f2c24f54551e", "9a9a")])
+    store.put_site("A-site-named-24-chars-xx", [("f2c24f54551e",)])
+    store.set_active("Home")
+    store.fix_device("bb" * 32, "Rooftop-Companion-Unit", [("3d63c6429436",)])
+    return store
+
+
+def _outbound_page(cols: int, rows: int) -> Screen:
+    """The Outbound paths page: sites, the active mark, and a fixed device."""
+    from meshterm.ui.outbound_screen import _PAGE_HINT, _page
+
+    title, prompt, items = _page(_outbound_store(), _outbound_env())
+    return SelectScreen(title, items, prompt=prompt, footer_hint=_PAGE_HINT, filterable=False)
+
+
+def _outbound_site(cols: int, rows: int) -> Screen:
+    """The page of the active site with staged changes: paths, evidence, actions, Apply."""
+    from meshterm.ui.outbound_screen import (
+        _EDIT_HINT,
+        _editor_items,
+        _site_actions,
+        _site_summary,
+    )
+
+    store = _outbound_store()
+    paths = store.site("Home").paths
+    return SelectScreen(
+        "Site — Home",
+        _editor_items(_outbound_env(), paths, _site_actions(store, "Home"), 2),
+        prompt=_site_summary(store, "Home", paths),
+        footer_hint=_EDIT_HINT,
+        filterable=False,
+        delete_hint="Del remove",
+    )
+
+
+def _outbound_composer(cols: int, rows: int) -> Screen:
+    """The composer in outbound mode: an open path of two hops."""
+    env = _outbound_env()
+    return PathComposerScreen(
+        device_label="Homestead",
+        device_hash=env.identity.key,
+        topology=env.topology,
+        width_bytes=1,
+        hops=["3d63c6429436", "f2c24f54551e"],
+        outbound=True,
+    )
+
+
+def _device_route_env():  # noqa: ANN202 - a type of the module under test
+    """The Device route popup for Alice: a learned route, and a kept route that is skipped."""
+    from datetime import timedelta
+
+    from meshterm.core.outbound_store import SOURCE_SITE, RouteOwner
+    from meshterm.services.device_routes import ORIGIN_LEARNED, RouteStatus
+    from meshterm.ui.device_route_screen import RouteEnv
+
+    env = _outbound_env()
+    topo = env.topology
+    target = "f2c24f54551e"
+    outbound = (("3d63c6429436",),)
+    route_env = RouteEnv(
+        contact=env.contacts[1],
+        label="Alice",
+        target=target,
+        topology=topo,
+        self_key=env.identity.key,
+        width_bytes=1,
+        resolve=lambda hop: None,
+        scenarios=topo.scenarios(target, device_route=("3d63c6429436",), outbound=outbound),
+        suggested=topo.suggested(target, outbound=outbound),
+        outbound=outbound,
+    )
+    status = RouteStatus(
+        hops=("3d",),
+        origin=ORIGIN_LEARNED,
+        changed_at=utcnow() - timedelta(minutes=5),
+        kept=("3d63c6429436", "9a9a"),
+        owner=RouteOwner(SOURCE_SITE, "A-site-named-24-chars-xx"),
+        skipped_since=utcnow() - timedelta(days=2),
+    )
+    return route_env, status
+
+
+def _device_route_page(cols: int, rows: int) -> Screen:
+    """The first page of the Device route popup: the route now, the kept route, the actions."""
+    from meshterm.ui.device_route_screen import _action_rows, _status_rows
+    from meshterm.ui.tui.select import Separator
+
+    env, status = _device_route_env()
+    items = [*_status_rows(env, status), Separator(" "), *_action_rows(status)]
+    return SelectScreen("Device route — Alice", items, filterable=False)
+
+
+def _device_route_picker(cols: int, rows: int) -> Screen:
+    """The picker page of the Device route popup: the suggested route first, then Compose."""
+    from meshterm.ui.device_route_screen import _picker_rows
+
+    env, status = _device_route_env()
+    return SelectScreen(
+        "Set the route — Alice",
+        _picker_rows(env, status),
+        prompt="The radio sends to the contact on this route:",
+        filterable=False,
     )
 
 
@@ -1416,6 +1568,16 @@ def _packet_viewer_unknown_scope(cols: int, rows: int) -> Screen:
     return _packet_viewer_scoped(cols, rows, region="elsewhere")
 
 
+class _LitRouteRow:
+    """The Device route row of Trace target after a trace came home on another route."""
+
+    def text(self, proven):  # noqa: ANN001, ANN201
+        return "Use this route for DMs and admin — 1/1 came home…", True
+
+    async def open(self, proven):  # noqa: ANN001, ANN201
+        return None
+
+
 def _trace(cols: int, rows: int) -> Screen:
     async def _noop_flow(current):  # noqa: ANN001
         return current
@@ -1441,6 +1603,7 @@ def _trace(cols: int, rows: int) -> Screen:
         previous=None,
         auto_spec=lambda: "",
         auto_source="",
+        route_row=_LitRouteRow(),
     )
     screen._on_trace(
         TraceResult(
@@ -1764,8 +1927,63 @@ def _links_qr(cols: int, rows: int) -> Screen:
     )
 
 
+def _clock_drift(cols: int, rows: int) -> Screen:
+    """The Clock drift page in its fullest form: a managed node, nodes out of sync, a name.
+
+    The offsets cover each side of the histogram, the longest offset text (``11h 59m
+    behind``), and a long name, so that the lanes meet the edge on each platform.
+    """
+    from datetime import timedelta
+
+    from meshterm.core.models import NODE_TYPE_CHAT, NODE_TYPE_REPEATER
+    from meshterm.services.clock_offsets import ClockOffset
+    from meshterm.ui.clocks_screen import ClockRow, clock_drift_screen
+
+    now = utcnow()
+
+    def row(name, key, offset_s, *, node_type=NODE_TYPE_CHAT, managed=False, keyed=True):  # noqa: ANN001, ANN202
+        who = key[:12] if keyed else name
+        offset = ClockOffset(who, keyed, offset_s, 6, now - timedelta(minutes=40))
+        contact = Contact(name=name, public_key=key, node_type=node_type) if keyed else None
+        return ClockRow(offset, name, key if keyed else None, node_type, managed, contact)
+
+    rows_ = [
+        row("Hilltop-Repeater", _HUB_KEY, 12, node_type=NODE_TYPE_REPEATER, managed=True),
+        row("A Rather Long Repeater Name For Width", "ab" * 32, -(11 * 3600 + 59 * 60)),
+        row("klkdeck", "cd" * 32, -(4 * 86400 + 6 * 3600)),
+        row("NONAME", "ef" * 32, -(3 * 365 * 86400)),
+        row("JRTx", "12" * 32, 54),
+        row("Raphael's T-Deck", "34" * 32, 2 * 3600),
+        row("Bob", "", -900, keyed=False),
+    ]
+    # A managed node that never sent a sample: its row says so, in the same lanes.
+    quiet = Contact(name="New Repeater", public_key="56" * 32, node_type=NODE_TYPE_REPEATER)
+    rows_.append(ClockRow(None, quiet.name, quiet.public_key, NODE_TYPE_REPEATER, True, quiet))
+    return clock_drift_screen(rows_, tolerance_s=300)
+
+
+def _clock_sync(cols: int, rows: int) -> Screen:
+    """The dialog of a bulk clock sync in its fullest form: each state, the longest notes."""
+    from meshterm.ui.clock_sync_dialog import ACTIVE, FAILED, OK, ClockSyncDialog
+    from meshterm.ui.tui.spinner import Spinner
+
+    nodes = [
+        Contact(name="Hilltop-Repeater", public_key=_HUB_KEY),
+        Contact(name="A Rather Long Repeater Name For Width", public_key="ab" * 32),
+        Contact(name="MTL BBS", public_key="cd" * 32),
+        Contact(name="Valley", public_key="ef" * 32),
+    ]
+    dialog = ClockSyncDialog(nodes, spinner=Spinner())
+    dialog.update(0, OK, "OK - clock set: 14:02 - 3/11/2026 UTC")
+    dialog.update(1, FAILED, "login refused; the saved password was cleared")
+    dialog.update(2, ACTIVE, "next in 5s")
+    return dialog
+
+
 _ENTRIES: list[_Entry] = [
     _Entry("dashboard", _dashboard),
+    _Entry("clock_drift", _clock_drift),
+    _Entry("clock_sync", _clock_sync),
     _Entry("dashboard-scoped", _dashboard_scoped),
     _Entry("contacts", _contacts),
     _Entry("archive_ladder", _archive_ladder),
@@ -1805,6 +2023,11 @@ _ENTRIES: list[_Entry] = [
     _Entry("message_paths_sent_scope", _message_paths_sent_scope),
     _Entry("remote_cli", _remote_cli),
     _Entry("path_composer", _path_composer),
+    _Entry("device_route_page", _device_route_page),
+    _Entry("device_route_picker", _device_route_picker),
+    _Entry("outbound_composer", _outbound_composer),
+    _Entry("outbound_page", _outbound_page),
+    _Entry("outbound_site", _outbound_site),
     _Entry("courier_outbox", _courier_outbox),
     _Entry("record_dialog", _record_dialog),
     _Entry("record_route", _record_route),
@@ -1871,8 +2094,11 @@ _PREEXISTING_REGULAR_OVERFLOW: set[str] = set()
 #: The hint line removes atoms to fit (``frame.fitted_footer``), so the test measures the
 #: hint that the footer draws, and checks that it keeps its way out. Each entry names its
 #: decision. ``courier_outbox``: JP, 2026-10-22, "bring the filter back, tough luck if it
-#: doesn't fit in the footer".
-_SHEDS_ITS_HINT: set[str] = {"courier_outbox"}
+#: doesn't fit in the footer". ``contacts``: the list cuts no value, so its hint gains
+#: ``←→ scroll`` while the highlighted row runs past the edge, and the atom is the first to
+#: go when the footer is full (``ContactListScreen.spare_hint_atoms``). ``archived``: the
+#: same list and the same hint (JP, 2026-11-03: "same behavior as contacts list").
+_SHEDS_ITS_HINT: set[str] = {"courier_outbox", "contacts", "archived"}
 
 
 #: The specimens by name, for a test that needs one entry and not the whole sweep.

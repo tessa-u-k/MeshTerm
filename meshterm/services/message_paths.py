@@ -191,9 +191,10 @@ def channel_arrivals(
         The matching arrivals, oldest first. Resends of the same message are included,
         and each carries its ``resend`` counter.
     """
-    frames = repo.packet_frames_between(
-        message.created_at - _CHANNEL_WINDOW, message.created_at + _CHANNEL_WINDOW
-    )
+    # Around the arrival time, not the sender time: a sender with a wrong clock put the
+    # window hours or years away from its packets.
+    at = message.arrived_at
+    frames = repo.packet_frames_between(at - _CHANNEL_WINDOW, at + _CHANNEL_WINDOW)
     arrivals: list[Arrival] = []
     for frame in frames:
         raw = frame.raw if isinstance(frame.raw, dict) else {}
@@ -244,9 +245,12 @@ def direct_window(repo: Repository, message: ChatMessage) -> tuple[datetime, dat
       send can come before it. The window opens at the message (minus a short time for
       jitter) and goes to the next send. Retries come after the send, so all the span
       goes forward.
-    * **A received message** has the time of the sender's clock, which can be before or
-      after the time when we heard it. Its window stays centred, and it goes halfway to
-      the messages before and after it.
+    * **A received message** has its arrival time on our clock
+      (:attr:`~meshterm.core.models.ChatMessage.arrived_at`). Its packets arrived a moment
+      before it, and their copies from other relays a moment after. A row from before
+      MeshTerm kept the arrival time has only the sender time, which can be before or
+      after the packets. Thus its window stays centred, and it goes halfway to the
+      messages before and after it.
 
     The window is never narrower than :data:`_MIN_HALF_WINDOW` on each side. Thus two
     messages one second apart still each have a span to search.
@@ -259,7 +263,7 @@ def direct_window(repo: Repository, message: ChatMessage) -> tuple[datetime, dat
         ``(start, end)`` for :meth:`~meshterm.persistence.repository.Repository
         .packet_frames_between`.
     """
-    at = message.created_at
+    at = message.arrived_at
     start, end = at - _DIRECT_WINDOW, at + _DIRECT_WINDOW
     previous, following = repo.direct_message_bounds(message.peer, at, outbound=message.outbound)
     if message.outbound:
@@ -291,17 +295,28 @@ def _pick_group(groups: dict[str, list[Arrival]], message: ChatMessage) -> list[
     body. The log cannot tell which group is this message. Thus the clock decides, and it
     decides well. The packets of a send start at the time when it was composed, and they
     continue through the retries. Thus the correct group is the earliest one that did not
-    start before the message. The fallback to the nearest group covers an inbound message,
-    whose time comes from the sender's clock and can be a little after the packet that we
-    heard.
+    start before the message.
+
+    A received message with an arrival time is the opposite case. The companion gives
+    MeshTerm the message after it received the packet. Thus the correct group is the
+    latest one that started before the arrival (with :data:`_MIN_HALF_WINDOW` of slack).
+
+    The fallback to the nearest group covers a received message from before MeshTerm kept
+    the arrival time, and one that waited in the companion. Its time comes from the
+    sender's clock, and it can be a little before or after the packet that we heard.
     """
     if not groups:
         return []
-    at = message.created_at
+    at = message.arrived_at
     started = {mac: min(a.when for a in arrivals) for mac, arrivals in groups.items()}
-    after = [mac for mac, first in started.items() if first >= at]
-    if after:
-        return groups[min(after, key=lambda mac: started[mac])]
+    if not message.outbound and message.received_at is not None and not message.waited:
+        before = [mac for mac, first in started.items() if first <= at + _MIN_HALF_WINDOW]
+        if before:
+            return groups[max(before, key=lambda mac: started[mac])]
+    else:
+        after = [mac for mac, first in started.items() if first >= at]
+        if after:
+            return groups[min(after, key=lambda mac: started[mac])]
     return groups[min(started, key=lambda mac: abs(started[mac] - at))]
 
 
@@ -455,3 +470,75 @@ def message_scope(
 def distinct_paths(arrivals: list[Arrival]) -> int:
     """The number of distinct relay paths that a set of arrivals covers."""
     return len({a.hops for a in arrivals})
+
+
+@dataclass(frozen=True, slots=True)
+class TraceWalk:
+    """The trace that walks the route of one arrival again, from our node.
+
+    Attributes:
+        target: The key of the node that the route goes to (a *Trace target* session), or
+            ``None`` when no key names it. A walk to a node with no key can turn only at
+            the last relay of the route, because no hash can address the node.
+        hops: For a walk to a node: the route from our node out to the node, without the
+            two ends. The trace turns at the node, or at the last relay before a node that
+            does not relay, and comes back on the mirror of the route. For a loop: the full
+            walk, which ends at a node that our node heard.
+        loop: Whether the route comes back to our node (a sent channel message), and not to
+            a node (a *Trace path* session).
+    """
+
+    target: str | None
+    hops: tuple[str, ...]
+    loop: bool = False
+
+
+def trace_walk(
+    arrival: Arrival,
+    *,
+    outbound: bool,
+    origin_key: str | None,
+    far_key: str | None,
+) -> TraceWalk | None:
+    """The trace that walks the route of an arrival, as the Message paths dialog draws it.
+
+    The dialog draws each arrival as a route from the origin of the message, through its
+    relays, to the node that the message was addressed to. A trace always starts at our
+    node. Thus it walks that same route from our end:
+
+    * **A message that our node sent** starts at our node. The trace walks the relays in
+      the same order. A direct message goes on to its recipient, and the trace turns back
+      there (``far_key``). A channel message came back to our node, and the relays are the
+      full walk: the last relay is a node that our node heard.
+    * **A message that our node received** ends at our node. The trace walks the relays
+      in the reverse order, back to the sender (``origin_key``). When no key names the
+      sender, the walk still goes to the sender, and the caller names it. Such a walk can
+      turn only at the first relay of the message, the relay that heard the sender.
+
+    A direct-routed copy gives no trace. Its hops are the part of a route that the packet
+    still had to go through, not where it went. Thus a trace on them starts at a node that
+    our node possibly cannot reach.
+
+    Args:
+        arrival: The arrival whose route the trace walks.
+        outbound: Whether our node sent the message.
+        origin_key: The key (or a key prefix) of the sender of a received message, or
+            ``None`` when it is unknown.
+        far_key: The key (or a key prefix) of the recipient of a sent direct message, or
+            ``None`` for a channel message, which comes back to our node.
+
+    Returns:
+        The walk, or ``None`` when the arrival has no route that a trace can walk.
+    """
+    if arrival.routed or not arrival.route_known:
+        return None
+    hops = arrival.hops
+    if outbound:
+        if far_key:
+            return TraceWalk(far_key, hops)
+        return TraceWalk(None, hops, loop=True) if hops else None
+    back = tuple(reversed(hops))
+    if origin_key:
+        return TraceWalk(origin_key, back)
+    # With no key and no relay, the walk has no hop at which it can turn.
+    return TraceWalk(None, back) if hops else None

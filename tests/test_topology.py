@@ -201,6 +201,147 @@ def test_neighbour_reports_feed_the_graph_as_fetched_evidence() -> None:
     assert "f2c24f54551e" in suggested and "beefbeef" in suggested
 
 
+# --- the direction of a reading -----------------------------------------------------
+
+
+def test_trace_readings_keep_the_direction_that_measured_them() -> None:
+    """Each hop of a trace measured the packet from the hop before it. The link keeps that."""
+    topo = _topo(trace_paths=[_traced(("3d", 12.5), ("f2", -5.5), ("3d", -6.5), (None, 11.75))])
+    us, hub, far = topo.self_id, "3d63c6429436", "f2c24f54551e"
+    assert topo.readings(us, hub) == [12.5]  # the hub heard our node
+    assert topo.readings(hub, us) == [11.75]  # our node heard the hub
+    assert topo.readings(hub, far) == [-5.5]
+    assert topo.readings(far, hub) == [-6.5]
+    assert sorted(topo.link(us, hub).snrs) == [11.75, 12.5]  # the pool is unchanged
+
+
+def test_packet_readings_are_what_our_node_heard() -> None:
+    """A received packet is a reading of the last relay toward our node, never the reverse."""
+    packet = PacketPath(when=utcnow(), origin="27d4396a2967", snr=8.0, hops=["3d63c6429436"])
+    topo = _topo(packet_paths=[packet])
+    assert topo.readings("3d63c6429436", topo.self_id) == [8.0]
+    assert topo.readings(topo.self_id, "3d63c6429436") == []
+    assert topo.readings(topo.self_id, "f2c24f54551e") == []  # no link at all
+
+
+def test_neighbour_report_readings_are_what_the_repeater_heard() -> None:
+    """A neighbour table holds the SNR that the repeater measured from each neighbour."""
+    reported = [NeighbourLink(when=utcnow(), repeater="3d63c6429436", neighbour="f2c2", snr=7.0)]
+    topo = _topo(neighbour_links=reported)
+    assert topo.readings("f2c24f54551e", "3d63c6429436") == [7.0]
+    assert topo.readings("3d63c6429436", "f2c24f54551e") == []
+
+
+def test_coalesce_keeps_the_direction_of_the_readings_of_a_stub() -> None:
+    """When a bare hop folds into its wide id, its readings keep the end that measured them."""
+    twin = Contact(name="Twin", public_key="27e4" + "0" * 60)
+    walks = [
+        _traced(("27", 5.0), ("f2", -3.0), ("27", -3.5), (None, 6.0)),
+        _traced(("27d4", 7.0), ("f2", -4.0), ("27d4", -4.5), (None, 8.0)),
+    ]
+    topo = _topo(trace_paths=walks, contacts=[REPEATER, FAR, LEAF, twin])
+    us, leaf, far = topo.self_id, "27d4396a2967", "f2c24f54551e"
+    assert sorted(topo.readings(us, leaf)) == [5.0, 7.0]
+    assert sorted(topo.readings(leaf, us)) == [6.0, 8.0]
+    assert sorted(topo.readings(leaf, far)) == [-4.0, -3.0]
+    assert sorted(topo.readings(far, leaf)) == [-4.5, -3.5]
+
+
+# --- outbound paths -----------------------------------------------------------------
+
+HUB, LEAF_ID, FAR_ID = "3d63c6429436", "27d4396a2967", "f2c24f54551e"
+
+
+def _two_ways(strong: int = 5, weak: int = 1, weak_age_hours: float = 0.0):  # noqa: ANN202
+    """Two ways to Far: through Hub (strong, often heard) and through Leaf (weak)."""
+    return _topo(
+        trace_paths=[
+            *[_traced(("3d", 12.0), ("f2", 10.0), ("3d", 10.0), (None, 12.0))] * strong,
+            *[_traced(("27", 2.0), ("f2", 0.0), ("27", 0.0), (None, 2.0), age_hours=weak_age_hours)]
+            * weak,
+        ]
+    )
+
+
+def test_an_outbound_path_starts_the_routes_although_the_evidence_prefers_another() -> None:
+    """The user knows the way out. The graph ranks a first hop by what our node heard."""
+    topo = _two_ways()
+    assert topo.scenarios(FAR_ID)[0].hops != (LEAF_ID,)  # the evidence alone prefers Hub
+    first = topo.scenarios(FAR_ID, outbound=[(LEAF_ID,)])[0]
+    assert (first.source, first.hops, first.rank) == ("outbound", (LEAF_ID,), 1)
+    assert topo.suggested(FAR_ID, outbound=[(LEAF_ID,)]).hops == (LEAF_ID,)
+
+
+def test_a_target_inside_an_outbound_path_is_reached_along_the_path() -> None:
+    """A route to a hop of the path is the part of the path before it, and it is trusted."""
+    topo = _two_ways()
+    (scenario,) = topo.outbound_scenarios(FAR_ID, [(LEAF_ID, FAR_ID, HUB)])
+    assert scenario.hops == (LEAF_ID,)
+    assert scenario.score > topo.scenarios(FAR_ID)[0].score
+
+
+def test_the_best_score_wins_and_the_order_of_the_user_breaks_a_near_tie() -> None:
+    """A much better second path wins. Two paths that score the same keep the user's order."""
+    topo = _two_ways(strong=5, weak=1)
+    ranked = topo.outbound_scenarios(FAR_ID, [(LEAF_ID,), (HUB,)])
+    assert [s.hops for s in ranked] == [(HUB,), (LEAF_ID,)]  # Hub is far stronger
+    even = _topo(
+        trace_paths=[
+            _traced(("3d", 5.0), ("f2", 5.0), ("3d", 5.0), (None, 5.0)),
+            _traced(("27", 5.0), ("f2", 5.0), ("27", 5.0), (None, 5.0)),
+        ]
+    )
+    assert [s.hops for s in even.outbound_scenarios(FAR_ID, [(LEAF_ID,), (HUB,)])] == [
+        (LEAF_ID,),
+        (HUB,),
+    ]
+    assert [s.hops for s in even.outbound_scenarios(FAR_ID, [(HUB,), (LEAF_ID,)])] == [
+        (HUB,),
+        (LEAF_ID,),
+    ]
+
+
+def test_an_outbound_path_whose_first_hop_went_silent_is_skipped() -> None:
+    """A first hop that our node did not hear for too long is probably off, or out of reach."""
+    topo = _two_ways(weak_age_hours=48.0)
+    quiet_since = utcnow() - timedelta(hours=24)
+    assert topo.outbound_scenarios(FAR_ID, [(LEAF_ID,)], silent_before=quiet_since) == []
+    assert topo.outbound_scenarios(FAR_ID, [(LEAF_ID,)])  # with no window, it stays
+    unknown = topo.outbound_scenarios(FAR_ID, [("9a9a",)], silent_before=quiet_since)
+    assert unknown == []  # no evidence at all is not silence, but no route continues from it
+
+
+def test_outbound_routes_go_before_a_device_route_that_starts_elsewhere() -> None:
+    """The firmware learns its route from what our node received. The user's way out wins."""
+    topo = _two_ways()
+    elsewhere = topo.scenarios(FAR_ID, device_route=(HUB,), outbound=[(LEAF_ID,)])
+    assert [s.source for s in elsewhere[:2]] == ["outbound", "device"]
+    agreed = topo.scenarios(FAR_ID, device_route=(LEAF_ID,), outbound=[(LEAF_ID,)])
+    assert agreed[0].hops == (LEAF_ID,)  # the device learned the user's way out
+    assert [s.hops for s in agreed].count((LEAF_ID,)) == 1
+
+
+def test_a_first_link_is_scored_by_how_well_the_far_end_hears_us() -> None:
+    """Our node hears Hub well, but Hub hears our node badly. Leaf is the better way out."""
+    packets = [
+        *[PacketPath(when=utcnow(), origin=None, snr=10.0, hops=[HUB])] * 20,
+        *[PacketPath(when=utcnow(), origin=None, snr=2.0, hops=[LEAF_ID])] * 20,
+    ]
+    walks = [
+        _traced(("3d", -12.0), ("f2", 5.0), ("3d", 5.0), (None, 10.0)),
+        _traced(("27", 8.0), ("f2", 5.0), ("27", 5.0), (None, 2.0)),
+    ]
+    topo = _topo(trace_paths=walks, packet_paths=packets)
+    us = topo.self_id
+    assert topo.link(us, HUB).median_snr > topo.link(us, LEAF_ID).median_snr  # the pool
+    assert [s.node for s in topo.next_hops(us)][:2] == [LEAF_ID, HUB]
+    assert topo.scenarios(FAR_ID)[0].hops == (LEAF_ID,)
+    # Away from our node, the pooled strength is unchanged.
+    assert topo.outward_strength(HUB, FAR_ID, topo.link(HUB, FAR_ID)) == topo.link(
+        HUB, FAR_ID
+    ).strength(topo._now)
+
+
 # --- suggestions and scenarios ----------------------------------------------------
 
 
@@ -458,7 +599,7 @@ async def test_probe_paths_defaults_to_one_trace_per_candidate() -> None:
 
 
 def _composer(  # noqa: ANN001
-    topo, hops=None, fetch_nodes=frozenset(), target=True, cursor=None, resolve=None
+    topo, hops=None, fetch_nodes=frozenset(), target=True, cursor=None, resolve=None, relays=True
 ):
     """A composer over ``topo``, pinned on Far (target mode) or with no target."""
     pinned = (
@@ -466,6 +607,7 @@ def _composer(  # noqa: ANN001
             target_id="f2c24f54551e",
             target_hash="f2c24f54551e" + "0" * 52,
             target_label="Far",
+            target_relays=relays,
         )
         if target
         else {}
@@ -499,6 +641,30 @@ def test_composer_suggests_from_tail_and_appends_on_enter() -> None:
     assert screen._hops == ["3d63c6429436"]
     # The target is excluded from the new tail, so Far never appears as a hop.
     assert all(s.node != "f2c24f54551e" for s in screen._suggestions())
+
+
+def test_composer_places_change_the_route_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    """^N flips the route preview between the node names and the places of the nodes."""
+    from meshterm.core.places import Place
+    from meshterm.services import places
+
+    class _Places:
+        def get(self, node: str | None) -> Place:
+            return Place("Villeray", None, "tiles")
+
+    monkeypatch.setattr(places, "_CURRENT", _Places())
+    screen = _composer(_topo(), hops=["3d63c6429436"])
+    assert "^N places" in screen.footer_hint and len(screen.footer_hint) <= 72
+    assert "Far" in _rows_plain(screen) and "Villeray" not in _rows_plain(screen)
+    screen.handle("places")
+    assert "^N names" in screen.footer_hint and len(screen.footer_hint) <= 72
+    body = _rows_plain(screen)
+    assert "Villeray" in body and "Far" not in screen._route_preview().text().plain
+    assert screen.picocalc_lyra_lane[0].label == "Names"
+    screen.handle("places")
+    assert "Far" in screen._route_preview().text().plain
+    # A path with no hop and no target has nothing for ^N to change, so no hint shows it.
+    assert "^N" not in _composer(_topo(), target=False).footer_hint
 
 
 def test_composer_windows_rows_under_the_pinned_route_preview() -> None:
@@ -678,8 +844,9 @@ def test_composer_use_row_names_the_action_not_the_path() -> None:
 async def test_composer_commits_spec_auto_and_cancel() -> None:
     """Use resolves the spec with its mirrored return leg. Auto resolves empty. Esc cancels.
 
-    Only the Esc key leaves. The action group ends at Auto, so End goes to the last row that
-    does something. It does not go to a row that only presses Esc for the user.
+    Only the Esc key leaves. The action group ends at Use, after Auto (JP, 2026-11-07), so
+    End goes to the row that leaves with the path. It does not go to a row that only
+    presses Esc for the user.
     """
     import asyncio
 
@@ -687,14 +854,14 @@ async def test_composer_commits_spec_auto_and_cancel() -> None:
 
     screen = _composer(_topo(trace_paths=walks), hops=["3d63c6429436"])
     screen.future = asyncio.get_running_loop().create_future()
-    screen.handle("end")  # jump to the last action row (Auto)…
-    screen.handle("up")  # …up to "Use this path"
+    screen.handle("end")  # "Use this path" closes the group
     screen.handle("enter")
     assert screen.future.result() == "3d,f2,3d"
 
     auto = _composer(_topo(trace_paths=walks))
     auto.future = asyncio.get_running_loop().create_future()
-    auto.handle("end")  # "Auto — let the device route" closes the group
+    auto.handle("end")  # jump to the last action row (Use)…
+    auto.handle("up")  # …up to "Auto — let the device route"
     auto.handle("enter")
     assert auto.future.result() == AUTO_SPEC
 
@@ -724,6 +891,56 @@ def test_composer_path_mode_opens_star_to_star_without_auto(monkeypatch) -> None
     ]
     assert stars == ["faint", "faint"]  # read-only, like each chip that the screen manages
     assert "Auto" not in _rows_plain(screen)
+
+
+async def test_composer_outbound_mode_returns_full_ids_and_keeps_its_end_open(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    """An outbound path has no return, no node two times, and the full id of each hop."""
+    import asyncio
+
+    monkeypatch.setattr(pathline, "powerline_enabled", lambda: False)  # assert the words
+    walks = [_traced(("3d", 12.0), ("f2", 5.0), ("3d", 5.0), (None, 12.0))]
+    topo = _topo(trace_paths=walks)
+    screen = PathComposerScreen(
+        device_label="Me", topology=topo, width_bytes=1, hops=["3d63c6429436"], outbound=True
+    )
+    assert screen.title == "Compose outbound path"
+    preview = screen._route_preview().text().plain
+    assert preview.endswith(f"{CURSOR_GLYPH} →")  # open: the route goes on from here
+    assert SELF_GLYPH not in preview[1:]  # our node only at the start
+    suggested = [s.node for s in screen._suggestions()]
+    assert "3d63c6429436" not in suggested and "f2c24f54551e" in suggested
+    screen.future = asyncio.get_running_loop().create_future()
+    screen.handle("enter")  # the top suggestion: Far
+    screen.handle("end")
+    screen.handle("enter")  # Use this path
+    assert screen.future.result() == "3d63c6429436,f2c24f54551e"
+
+
+def test_composer_offers_the_outbound_paths_first_at_our_node_only() -> None:
+    """At our node, the user's ways out lead the rows. Enter inserts the whole path."""
+    walks = [_traced(("3d", 12.0), ("f2", 5.0), ("3d", 5.0), (None, 12.0))]
+    topo = _topo(trace_paths=walks)
+    screen = PathComposerScreen(
+        device_label="Me",
+        topology=topo,
+        width_bytes=1,
+        outbound_paths=((LEAF_ID, HUB), (FAR_ID,)),
+    )
+    kinds = [kind for kind, _ in screen._rows()]
+    assert kinds[:2] == ["outbound", "outbound"]
+    assert "your paths first" in _rows_plain(screen)
+    screen.handle("enter")  # outbound path 1: Leaf → Hub
+    assert screen.hops == [LEAF_ID, HUB]
+    assert "outbound" not in [kind for kind, _ in screen._rows()]  # the slot left our node
+    screen.handle("left")
+    screen.handle("left")  # back at our node, but path 1 is in the route already
+    assert [p for kind, p in screen._rows() if kind == "outbound"] == [(2, (FAR_ID,))]
+    outbound_mode = PathComposerScreen(
+        device_label="Me", topology=topo, width_bytes=1, outbound=True, outbound_paths=((HUB,),)
+    )
+    assert "outbound" not in [kind for kind, _ in outbound_mode._rows()]
 
 
 def test_composer_names_an_ambiguous_hop_through_the_owning_screens_resolver() -> None:
@@ -1015,3 +1232,80 @@ def test_composer_row_cursor_clamps_at_both_ends() -> None:
     for _ in range(last + 5):
         screen.handle("down")
     assert screen._index == last
+
+
+# --- a target that does not relay -------------------------------------------------------
+
+
+def test_only_a_repeater_or_an_unknown_type_relays_a_trace() -> None:
+    """A companion, a room server, and a sensor stop a trace with the firmware defaults."""
+    from meshterm.core.models import (
+        NODE_TYPE_CHAT,
+        NODE_TYPE_REPEATER,
+        NODE_TYPE_ROOM,
+        NODE_TYPE_SENSOR,
+        relays_traces,
+    )
+
+    assert relays_traces(NODE_TYPE_REPEATER)
+    assert relays_traces(None)  # MeshTerm cannot tell, so it traces the node itself
+    assert not any(relays_traces(t) for t in (NODE_TYPE_CHAT, NODE_TYPE_ROOM, NODE_TYPE_SENSOR))
+
+
+def test_a_target_that_does_not_relay_turns_the_walk_at_its_last_relay() -> None:
+    """A companion stops a trace, so the walk turns at the relay that hears it.
+
+    The route to the companion stays the same. Only the walk changes: the companion is not
+    in it, and its hash does not limit the width of the walk.
+    """
+    from meshterm.services.topology import render_forced_spec
+
+    target = "d4e5" + "00" * 30
+    hops = ("3d63c6429436", "f2c24f54551e")
+    assert render_forced_spec(hops, target, 2) == "3d63,f2c2,d4e5,f2c2,3d63"
+    assert render_forced_spec(hops, target, 2, relays=False) == "3d63,f2c2,3d63"
+    assert render_forced_spec(hops[:1], target, 2, relays=False) == "3d63"
+    assert render_forced_spec((), target, 2, relays=False) == ""  # no relay: no turn
+    assert render_forced_spec(hops, "d4", 2) == "3d,f2,d4,f2,3d"
+    assert render_forced_spec(hops, "d4", 2, relays=False) == "3d63,f2c2,3d63"
+
+
+@pytest.mark.parametrize("relays", [True, False])
+def test_forced_outbound_finds_the_route_that_the_forced_spec_walks(relays: bool) -> None:
+    """The two functions are inverses, for a target that relays and for one that does not."""
+    from meshterm.services.topology import forced_outbound, render_forced_spec
+
+    target = "d4e5" + "00" * 30
+    for hops in (("3d63",), ("3d63", "f2c2"), ("3d63", "f2c2", "27d4")):
+        spec = render_forced_spec(hops, target, 2, relays=relays)
+        assert forced_outbound(spec.split(","), target, relays=relays) == hops
+    assert forced_outbound(["3d63", "f2c2"], target, relays=relays) is None  # even: no turn
+    assert forced_outbound(["3d63", "f2c2", "27d4"], target, relays=relays) is None
+
+
+def test_composer_for_a_target_that_does_not_relay_turns_at_the_last_hop() -> None:
+    """The walk turns at the last composed hop. Far is not in the spec or in the preview."""
+    screen = _composer(_topo(), hops=["3d63c6429436", "27d4396a2967"], relays=False)
+    assert screen._spec() == "3d,27,3d"
+    assert screen._walk_nodes() == ["3d63c6429436", "27d4396a2967", "3d63c6429436"]
+    assert "Far" not in screen._route_preview().text().plain
+    assert _composer(_topo(), relays=False)._spec() == ""  # no relay: nothing to walk
+
+
+def test_composer_for_a_target_known_by_name_only_still_mirrors_the_route() -> None:
+    """A sender with no key is target mode by its label: the route mirrors, with no Auto row."""
+    screen = PathComposerScreen(
+        device_label="Us",
+        device_hash=US + "0" * 52,
+        topology=_topo(),
+        width_bytes=1,
+        target_label="Lindsay",
+        target_relays=False,
+        hops=["3d63c6429436", "27d4396a2967"],
+    )
+    assert screen.title == "Compose path — Lindsay"
+    assert screen._spec() == "3d,27,3d"
+    assert screen._walk_nodes() == ["3d63c6429436", "27d4396a2967", "3d63c6429436"]
+    actions = [payload for kind, payload in screen._rows() if kind == "action"]
+    assert "auto" not in actions  # no key: the session has no route to plan
+    assert actions == ["use"]

@@ -46,11 +46,13 @@ from rich.table import Table
 from rich.text import Text
 
 from ..core.connection import REMOTE_TX_MAX, REMOTE_TX_MIN
-from ..core.models import Contact, LoginResult, TraceResult, TxLevelResult, TxOptResult
+from ..core.models import Contact, TraceResult, TxLevelResult, TxOptResult
 from ..services import trace_runner, tx_optimizer
 from ..services.topology import build_topology, render_custom_spec
 from .menus import icon_lane, icon_mark
 from .pathline import SELF_GLYPH, PathHop, PathLine, cut_to, path_line
+from .placemode import ACTION as PLACES_ACTION
+from .placemode import PlaceToggle, node_of, placed, places_of_session
 from .theme import name_style, snr_style
 from .trace_screen import TracingDialog, collapse_trace_width, snr_bar
 from .tui.render import render_lines, render_to_ansi
@@ -167,6 +169,8 @@ class TxSweepScreen(Screen):
         self._device_label = device_label
         self._device_hash = device_hash
         self._resolve = resolve
+        #: ^N: the path lines show the node names, or the places of the nodes.
+        self._places = PlaceToggle()
         self._session = session
         self._run_sweep = run_sweep
         self._apply_winner = apply_winner
@@ -215,8 +219,23 @@ class TxSweepScreen(Screen):
     def footer_hint(self) -> str:  # type: ignore[override]
         """The footer keys. They change when a sweep is in flight."""
         if self.running:
-            return "sweeping… · PgUp/PgDn scroll · Esc back"
-        return "↑↓ actions · Enter run · PgUp/PgDn scroll · Esc back"
+            return f"sweeping… · PgUp/PgDn scroll · {self._places.hint} · Esc back"
+        return f"↑↓ actions · Enter run · PgUp/PgDn scroll · {self._places.hint} · Esc back"
+
+    @property
+    def picocalc_lyra_lane(self):
+        """The shared pager on F4/F5, and the ^N change of the path lines on F1."""
+        from .tui.fkeys import FPair, default_lane
+
+        lane = list(default_lane())
+        lane[0] = FPair(self._places.chip, PLACES_ACTION)
+        return lane
+
+    def _placed(self, line: PathLine) -> PathLine:
+        """The path line, with each node name changed to its place while ^N has that choice."""
+        if not self._places.on:
+            return line
+        return placed(line, places_of_session(), node_of(self._resolve))
 
     def _can_apply(self) -> bool:
         """Whether Apply is offered: the sweep finished, it has a winner, and it is not applied."""
@@ -305,6 +324,8 @@ class TxSweepScreen(Screen):
         """Move the highlight of the actions, commit the selected action, scroll, or leave."""
         if action == "enter":
             self._commit_action()
+        elif action == PLACES_ACTION:
+            self._places.flip()
         elif action == "up":
             # Both ends clamp and do not wrap. This is the rule of the whole app for the
             # highlight of a row. A highlight that jumps from one end to the other takes
@@ -414,11 +435,13 @@ class TxSweepScreen(Screen):
                 # in the word before them.
                 text.append("Route — via ")
                 text.append_text(
-                    path_line(
-                        list(self.route_hops),
-                        self._resolve,
-                        from_origin=False,
-                        to_destination=False,
+                    self._placed(
+                        path_line(
+                            list(self.route_hops),
+                            self._resolve,
+                            from_origin=False,
+                            to_destination=False,
+                        )
                     ).text()
                 )
             else:
@@ -463,7 +486,7 @@ class TxSweepScreen(Screen):
             (self._target_label, name_style(self._target_label, self._target_key)),
         )
         lines = [render_to_ansi(tuning, width, no_wrap=True)]
-        route = self._route_line().wrapped(width, indent=9)
+        route = self._placed(self._route_line()).wrapped(width, indent=9)
         first = Text("route    ", style="muted")
         first.append_text(route[0])
         lines.append(render_to_ansi(first, width, no_wrap=True))
@@ -634,6 +657,7 @@ async def open_tx_optimize(
         RuntimeError: If the caller calls it outside the interactive menu (there is no
             full-screen session).
     """
+    from .admin_login import log_in
     from .path_composer import AUTO_SPEC, PathComposerScreen
     from .surface import TuiUi
     from .tui import CANCEL, Choice, SelectScreen
@@ -699,6 +723,12 @@ async def open_tx_optimize(
             neighbour_links=ctx.repo.neighbour_links(),
         )
         admin_id = topo.canonical(admin_hash) or admin_hash[:12]
+        # The user's ways out lead the first slot, as on the trace screens.
+        store = getattr(ctx, "outbound_store", None)
+        choice = store.lookup(device_hash) if store is not None else None
+        outbound = tuple(
+            tuple(topo.canonical(h) or h for h in path) for path in (choice.paths if choice else ())
+        )
         composer = PathComposerScreen(
             device_label=device_label,
             device_hash=device_hash,
@@ -709,6 +739,7 @@ async def open_tx_optimize(
             target_label=admin_node.name,
             hops=[topo.canonical(h) or h for h in screen.route_hops],
             resolve=resolve,  # name a hop that the topology left ambiguous, as we do
+            outbound_paths=outbound,
         )
         result = await session.run_screen(composer)
         if result is CANCEL or not isinstance(result, str):
@@ -827,44 +858,22 @@ async def open_tx_optimize(
         nonlocal logged_in
         if logged_in:
             return True
-        password = ctx.admin_store.get(admin_node)
-        if password is None:
-            password = await session.text(
-                f"Admin password for {admin_node.name}",
-                prompt="The repeater ignores tuning commands without an admin login.",
-                password=True,
-            )
-            if not password:
-                return False
-        async with ctx.ui.busy_overlay():
-            outcome = await device.admin_login(admin_node, password)
-        ctx.admin_store.record(admin_node, password, outcome)
-        if outcome is LoginResult.REFUSED:
+
+        def show_login() -> None:
             screen.login_text = login_text()
-            await session.message_dialog(
-                Text(
-                    f"{admin_node.name!r} rejected the admin login (wrong password?). "
-                    "The saved password was cleared; sweep again to enter a new one.",
-                    style="err",
-                ),
-                title="Admin login",
-            )
-            return False
-        if not outcome:
-            # No reply is not a denial. The password stays for the next attempt.
-            screen.login_text = login_text()
-            await session.message_dialog(
-                Text(
-                    f"No reply from {admin_node.name} — it may be out of reach, asleep, "
-                    "or busy. The saved password was kept; sweep again when it answers.",
-                    style="warn",
-                ),
-                title="Admin login",
-            )
-            return False
-        logged_in = True
-        screen.login_text = login_text()
-        return True
+
+        # The shared login of the menu. It offers a new password when the stored one gets
+        # no reply (refer to :mod:`meshterm.ui.admin_login`).
+        logged_in = await log_in(
+            ctx,
+            device,
+            admin_node,
+            why="The repeater ignores tuning commands without an admin login.",
+            again="sweep again",
+            on_record=show_login,
+        )
+        show_login()
+        return logged_in
 
     async def apply_dialog() -> None:
         """Offer the winner in a floating dialog. If the user selects Apply, write it."""

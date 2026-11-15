@@ -148,7 +148,7 @@ def test_snr_bar_unlit_track_dims_to_a_distinct_style() -> None:
     assert snr_bar(10.0).plain == _BAR_FULL * _BAR_WIDTH  # top of range: every cell full
 
 
-# --- _previous_outbound -----------------------------------------------------------
+# --- previous_outbound ------------------------------------------------------------
 
 
 def _walk(*nodes: str, success: bool = True) -> TraceResult:
@@ -167,30 +167,45 @@ def test_previous_outbound_extracts_the_proven_route() -> None:
     report flood). Thus this stored evidence is what auto mode walks for a target that
     has more than one hop.
     """
-    from meshterm.ui.trace_screen import _previous_outbound
+    from meshterm.services.trace_plan import previous_outbound
 
     walk = _walk("3d63", "f2c2", "aabb", "f2c2", "3d63")
-    assert _previous_outbound(walk, "aabb" + "00" * 30) == ("3d63", "f2c2")
+    assert previous_outbound(walk, "aabb" + "00" * 30) == ("3d63", "f2c2")
 
 
 def test_previous_outbound_direct_walk_yields_no_repeaters() -> None:
     """A direct answer (the target only) gives an empty outbound leg: destination only again."""
-    from meshterm.ui.trace_screen import _previous_outbound
+    from meshterm.services.trace_plan import previous_outbound
 
-    assert _previous_outbound(_walk("aabb"), "aabb" + "00" * 30) == ()
+    assert previous_outbound(_walk("aabb"), "aabb" + "00" * 30) == ()
 
 
 def test_previous_outbound_rejects_unusable_history() -> None:
     """MeshTerm never reuses failures, asymmetric walks, and walks that turned elsewhere."""
-    from meshterm.ui.trace_screen import _previous_outbound
+    from meshterm.services.trace_plan import previous_outbound
 
     target = "aabb" + "00" * 30
-    assert _previous_outbound(None, target) is None
-    assert _previous_outbound(_walk("3d63", "aabb", "3d63", success=False), target) is None
+    assert previous_outbound(None, target) is None
+    assert previous_outbound(_walk("3d63", "aabb", "3d63", success=False), target) is None
     # Asymmetric: it came home a different way, so it is not a boomerang to this target.
-    assert _previous_outbound(_walk("3d63", "aabb", "f2c2"), target) is None
+    assert previous_outbound(_walk("3d63", "aabb", "f2c2"), target) is None
     # Palindromic, but it turned at some other node and not at our target.
-    assert _previous_outbound(_walk("3d63", "9999", "3d63"), target) is None
+    assert previous_outbound(_walk("3d63", "9999", "3d63"), target) is None
+
+
+def test_previous_outbound_of_a_target_that_does_not_relay_keeps_the_turn() -> None:
+    """A walk to a companion turned at its last relay. That relay ends the route to it.
+
+    The companion stops a trace, so it is never in the walk. The middle hop is the relay
+    that hears it, and the route to the companion goes up to and with that relay.
+    """
+    from meshterm.services.trace_plan import previous_outbound
+
+    target = "aabb" + "00" * 30
+    walk = _walk("3d63", "f2c2", "3d63")
+    assert previous_outbound(walk, target, relays=False) == ("3d63", "f2c2")
+    assert previous_outbound(_walk("3d63"), target, relays=False) == ("3d63",)
+    assert previous_outbound(_walk("3d63", "f2c2", "9999"), target, relays=False) is None
 
 
 # --- _previous_walk ---------------------------------------------------------------
@@ -233,6 +248,8 @@ def _trace_screen(
     auto_spec=None,
     auto_source="",
     open_trophy_case=None,
+    route_row=None,
+    **extra,  # noqa: ANN003 - more TraceScreen arguments, as given
 ) -> tuple[TraceScreen, _FakeSession]:
     session = _FakeSession()
 
@@ -261,9 +278,117 @@ def _trace_screen(
         auto_spec=auto_spec or (lambda: ""),
         auto_source=auto_source,
         open_trophy_case=open_trophy_case,
+        route_row=route_row,
+        **extra,
     )
     screen.note_viewport(40)  # the frame records this before each real paint
     return screen, session
+
+
+def test_trace_screen_names_the_relay_where_a_companions_walk_turns() -> None:
+    """Alice stops a trace, so her walk turns at f2c2. A line under the route says so."""
+    screen, _ = _trace_screen(
+        auto_spec=lambda: "3d63,f2c2,3d63", auto_source="best observed · 5×", relays=False
+    )
+    body = _plain(screen.render_body(72))
+    assert "Alice can't relay a trace, so the trace turns at f2c2" in body
+    assert screen._actions[screen._index] == "trace"  # a turn: Enter traces at once
+
+
+def test_trace_screen_for_a_sender_known_by_name_only_has_no_explore_row() -> None:
+    """A target with no key has no node in the graph to rank routes to, so Explore is gone.
+
+    The screen still opens armed on the walk that turns at the relay of the sender, and the
+    groups of rows keep their gaps.
+    """
+    keyed, _ = _trace_screen(initial_spec="3d63,f2c2,3d63", relays=False)
+    assert "explore" in keyed._actions  # a target with a key keeps it
+    bare = TraceScreen(
+        "Lindsay",
+        mode="target",
+        device_label="Us",
+        device_hash="aabb" + "00" * 30,
+        resolve=lambda label: label,
+        session=_FakeSession(),
+        trace=None,  # type: ignore[arg-type]
+        compose_path=None,  # type: ignore[arg-type]
+        explore=None,
+        pick_width=None,  # type: ignore[arg-type]
+        pick_samples=None,  # type: ignore[arg-type]
+        width_bytes=lambda: 2,
+        sample_count=lambda: 1,
+        pace_s=0.0,
+        previous=None,
+        auto_spec=lambda: "",
+        initial_spec="3d63,f2c2,3d63",
+        relays=False,
+    )
+    bare.note_viewport(40)
+    assert bare.title == "Trace — Lindsay"
+    assert bare._actions == ("compose", "width", "samples", "trace")
+    assert bare._actions[bare._index] == "trace"  # armed: Enter traces at once
+    lines = _plain(bare.render_body(72)).splitlines()
+    assert "Lindsay can't relay a trace, so the trace turns at f2c2" in " ".join(lines)
+    compose = next(i for i, line in enumerate(lines) if "Compose" in line)
+    assert lines[compose + 1].strip() == ""  # the build group ends on Compose
+
+
+def test_trace_screen_wraps_the_turn_line_under_the_route_lane() -> None:
+    """The line is a sentence, so it wraps at 53 cells, and no line of the page is wider."""
+    from rich.cells import cell_len
+
+    screen, _ = _trace_screen(
+        auto_spec=lambda: "3d63,f2c2,3d63", relays=False, target_label="A-companion-name"
+    )
+    lines = _plain(screen.render_body(53)).splitlines()
+    assert all(cell_len(line) <= 53 for line in lines)
+    note = [line for line in lines if "relay a trace" in line or "turns at" in line]
+    assert len(note) == 2 and all(line.startswith(" " * 7) for line in note)
+
+
+async def test_trace_screen_with_no_relay_to_turn_at_has_nothing_to_walk() -> None:
+    """A companion with no relay on its route: Trace is dim, and Enter on it sends nothing."""
+    ran: list[str] = []
+
+    async def trace(path_spec, on_trace):  # noqa: ANN001
+        ran.append(path_spec)
+
+    screen, _ = _trace_screen(trace=trace, relays=False)
+    body = " ".join(_plain(screen.render_body(72)).split())  # the line wraps at 72 cells
+    assert "none — no relay to turn at" in body
+    assert "Alice can't relay a trace, and no relay on the way to it is known" in body
+    assert "Trace — no relay to turn at" in body
+    assert screen._actions[screen._index] == "compose"  # the highlight starts where it can act
+    screen._index = screen._actions.index("trace")
+    screen.handle("enter")
+    assert ran == [] and screen._worker is None
+
+
+def test_trace_screen_offers_no_relays_for_a_neighbour_that_does_not_relay() -> None:
+    """A neighbour companion has no relay to turn at, and its route is no relays.
+
+    The Device route row offers that route at once. When a spec gives a walk, the offer
+    goes away, because the screen then proves a route of its own.
+    """
+    from meshterm.ui.device_route_screen import ProvenRoute
+
+    offer = ProvenRoute(hops=(), home=0, sent=0, heard=4)
+    screen, _ = _trace_screen(relays=False, neighbour=True, offer=offer)
+    body = " ".join(_plain(screen.render_body(72)).split())  # the line wraps at 72 cells
+    assert "it's a direct neighbour: no relay to turn at" in body
+    assert screen.proven() == offer
+    armed, _ = _trace_screen(auto_spec=lambda: "3d63", relays=False, offer=offer)
+    assert armed.proven() is None
+
+
+class _RouteRowStub:
+    """The Device route row of Trace target, as the screen reads it (refer to RouteRow)."""
+
+    def text(self, proven):  # noqa: ANN001, ANN201
+        return "Device route — none, it floods…", False
+
+    async def open(self, proven):  # noqa: ANN001, ANN201
+        return None
 
 
 async def test_trace_screen_one_trace_per_enter_accumulates() -> None:
@@ -553,7 +678,12 @@ async def test_compose_seeds_from_the_visible_route_not_the_empty_spec() -> None
 
 
 async def test_trace_screen_explore_adopts_a_scenario_path() -> None:
-    """If the user commits Explore paths, the flow runs. An adopted path sets the spec."""
+    """If the user commits Explore paths, the flow runs. An adopted path sets the spec.
+
+    An adopted path also moves the highlight to Trace, the same as the composer, so a
+    plain Enter walks it (GitHub #29). A cancelled explorer leaves the highlight where it
+    was.
+    """
 
     async def adopt(current: str):  # noqa: ANN001
         return "3d63,f2c2"
@@ -561,17 +691,21 @@ async def test_trace_screen_explore_adopts_a_scenario_path() -> None:
     screen, _ = _trace_screen(explore=adopt)
     for _ in range(3):
         screen.handle("up")  # Trace → Sample count → Path width → Explore paths
+    assert screen._actions[screen._index] == "explore"
     screen.handle("enter")
     await asyncio.sleep(0)
     assert screen._path_spec == "3d63,f2c2"
+    assert screen._actions[screen._index] == "trace"
 
     async def keep(current: str):  # noqa: ANN001
         return None
 
     screen._explore = keep
-    screen.handle("enter")  # the highlight is still on Explore paths
+    screen._index = screen._actions.index("explore")
+    screen.handle("enter")
     await asyncio.sleep(0)
     assert screen._path_spec == "3d63,f2c2"  # None leaves the spec untouched
+    assert screen._actions[screen._index] == "explore"
 
 
 async def test_trace_screen_action_labels_share_one_column() -> None:
@@ -626,7 +760,8 @@ def test_every_action_row_starts_its_words_in_one_cell_in_both_modes(platform_na
     starts: set[int] = set()
     marks: set[str] = set()
     for mode in ("target", "path"):
-        screen, _ = _trace_screen(mode=mode)
+        # Target mode with the Device route row, so that each declared mark is drawn.
+        screen, _ = _trace_screen(mode=mode, route_row=_RouteRowStub())
         for key in screen._actions:
             for selected in (False, True):
                 row = screen._action_text(key, selected).plain
@@ -733,7 +868,8 @@ async def test_composer_commit_parks_the_cursor_on_trace() -> None:
     await asyncio.sleep(0)
     assert screen._actions[screen._index] == "trace"
 
-    # Only the composer moves the highlight: the width flow keeps it where it is.
+    # Only the composer and the explorer move the highlight: the width flow keeps it where
+    # it is.
     async def width(current):  # noqa: ANN001
         return "3d63,f2c2,3d63"
 
@@ -993,13 +1129,21 @@ def test_trace_log_section_hidden_until_there_is_something_to_log() -> None:
 
 
 async def test_trace_screen_path_mode_gates_trace_and_drops_explore() -> None:
-    """Path mode has no Explore row, and Trace does nothing until a path exists."""
+    """Path mode has no Explore row, and Trace does nothing until a path exists.
+
+    With no path, the highlight starts on Compose path, because Trace cannot act
+    (GitHub #29). Enter then opens the composer.
+    """
     screen, _ = _trace_screen(mode="path")
     body = _plain(screen.render_body(100))
     assert "Explore paths" not in body
     assert "Trace — compose a path first" in body
     assert "none — compose a path" in body
-    screen.handle("enter")  # the highlight starts on Trace, but there is nothing to walk
+    assert screen._actions[screen._index] == "compose"
+    for _ in screen._actions:
+        screen.handle("down")  # down to Trace, the last action row (the end clamps)
+    assert screen._actions[screen._index] == "trace"
+    screen.handle("enter")  # there is nothing to walk
     assert not screen._running and screen._worker is None
     screen._path_spec = "3d,f2"
     assert "Trace — one transmission" in _plain(screen.render_body(100))
@@ -1251,6 +1395,41 @@ def test_sweep_screen_opens_armed_and_idle_on_sweep() -> None:
     assert not screen.running and ran == []
     screen.handle("enter")  # the highlight starts on Sweep
     assert ran == [True]
+
+
+def test_sweep_screen_places_change_the_route_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """^N flips the route line between the node names and the places of the nodes."""
+    from meshterm.core.places import Place
+    from meshterm.services import places
+
+    class _Places:
+        def get(self, node: str | None) -> Place:
+            return Place("Villeray", None, "tiles")
+
+    monkeypatch.setattr(places, "_CURRENT", _Places())
+    session = _FakeSession()
+    screen = TxSweepScreen(
+        admin_label="Repeater",
+        target_label="Alice",
+        admin_key="aa" * 32,
+        target_key="bb" * 32,
+        device_label="us",
+        device_hash="00" * 32,
+        resolve=lambda h: h,
+        session=session,
+        tx_min=12,
+        tx_max=28,
+        step=3,
+        samples=3,
+        run_sweep=lambda: None,
+        apply_winner=lambda: None,
+    )
+    assert "^N places" in screen.footer_hint and "Villeray" not in _plain(screen.render_body(100))
+    screen.handle("places")
+    assert "^N names" in screen.footer_hint and "Villeray" in _plain(screen.render_body(100))
+    assert screen.picocalc_lyra_lane[0].label == "Names"
+    screen.handle("places")
+    assert "Villeray" not in _plain(screen.render_body(100))
 
 
 def test_sweep_screen_quotes_the_transmission_budget() -> None:

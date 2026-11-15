@@ -171,6 +171,7 @@ and in quoted text.
 | contact | A node that your device knows. It is **discovered** (heard, not added) or **added** (in the contact list, and you can send messages to it). Each contact is a node. Not each node is a contact | |
 | our node | The node of the companion that MeshTerm is connected to. On the screen, it is "you" (★) | own node, self node, local node |
 | companion | A node that a program (such as MeshTerm) controls through USB, Bluetooth, or TCP | |
+| managed node | A node whose admin password MeshTerm stores, so that the user can log in to it with no prompt. It has the `🔑` mark | remembered admin, administered node |
 | device | The companion that MeshTerm is connected to (the `Device` class) | radio (for the companion) |
 | handheld | A small computer that runs MeshTerm on its own screen: the PicoCalc, the Cardputer Zero, or the uConsole | device (for the computer), on-device |
 | radio | The LoRa radio in a node | |
@@ -182,7 +183,16 @@ and in quoted text.
 | path | An ordered list of hops that you write or force (`a1,3d,…`) | |
 | route | The sequence of nodes that a trace went through or will go through | |
 | hop | One node in a path or a route | |
+| outbound path | A path that starts at our node and goes out into the mesh, one or more hops long. The user trusts it for the first hops of a route, because the user knows which way out works | outbound leg (for this: an outbound leg is the outbound half of a trace) |
+| site | A name for where the user takes the computer (`Home`, `Foulab`), with its outbound paths in order. One site is active | profile (for this: a profile is a connection alias in `config.toml`) |
+| fixed device | A companion that never moves. It keeps its own outbound paths, and the active site does not apply to it | |
+| device route | The route that the radio holds for one contact: the relays that it sends to the contact through. The radio learns it from a path return, and replaces it with each new one | out path, contact path (for this) |
+| kept route | A device route that the user chose and told MeshTerm to keep. MeshTerm writes it back each time that the radio replaces it. It belongs to the active site or to a fixed device | pinned route |
+| saved route | A device route that the radio learned at a site. MeshTerm saves it when the user changes site, and writes it back when the user returns | |
+| path discovery | One flood request to a contact. The answer tells the route in each direction, and the device route does not change | |
 | via | The prefix for the relay chain of a packet or a message | |
+| location | The coordinates (latitude and longitude) that a node advertises | coordinates (alone) |
+| place | The named area nearest the location of a node: a neighbourhood, a village, a town, or a peak. It has a fine part and a coarse part (`Villeray, Montréal`) | location name, locality |
 | region | A named area for which a repeater relays floods (`region put yul`). Shown without `#` | |
 | scope | The region to which a flood is limited | |
 | unscoped | A flood that each repeater relays when it permits the wildcard `*` | |
@@ -194,6 +204,11 @@ and in quoted text.
 | packet | One radio transmission | frame (for radio data) |
 | protocol frame | One unit of the companion protocol on USB, Bluetooth, or TCP: a command, a reply, or a push from the companion. In code that handles only this protocol, "frame" alone is permitted | packet (for this) |
 | message | A text message, direct or on a channel | |
+| sender time | The time that a message or an advert carries, from the clock of the node that sent it. It is a claim, and a node with a wrong clock makes it false | timestamp (alone) |
+| arrival time | Our clock when MeshTerm got a received message from the companion (`received_at`) | receive time |
+| clock offset | The sender time minus the arrival time. A positive offset is a clock ahead of ours. The offset of a node is the median of its three newest clock samples | skew, drift (for this) |
+| clock sample | One packet that gives a clock offset: an advert, a direct message, or a channel message, with its sender time and our time | |
+| corrected time | The arrival time that the screen shows in place of a wrong sender time, with the `?` mark | |
 | send | MeshTerm gives a message, a packet, or a command to the device | emit |
 | transmit | A radio puts a packet on the air | |
 | broadcast | Transmit to all nodes, with no destination | |

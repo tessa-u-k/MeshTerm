@@ -849,6 +849,18 @@ async def _menu_loop(ctx: AppContext, session: TuiSession) -> None:
     )
     session.set_root(menu)
     loop = asyncio.get_running_loop()
+
+    def offer_site_now() -> None:
+        """Ask about a suggested site at once, but only over the main menu.
+
+        The suggestion arrives while the user does something. Over a screen, it waits for
+        the next round of the menu, so that it never interrupts a screen.
+        """
+        if session.top is menu:
+            session.run_detached(_offer_pending_site(ctx))
+
+    if getattr(ctx, "site_suggest", None) is not None:
+        ctx.site_suggest.on_ready = offer_site_now
     while True:
         try:
             await _menu_round(ctx, session, menu, tools, loop)
@@ -859,6 +871,16 @@ async def _menu_loop(ctx: AppContext, session: TuiSession) -> None:
             # popped itself. The only remaining step is to disarm and paint the menu that
             # the user asked for.
             session.unwound()
+
+
+async def _offer_pending_site(ctx: AppContext) -> None:
+    """Ask the user about the site that the radio seems to be at, if a suggestion waits."""
+    service = getattr(ctx, "site_suggest", None)  # a stub context of a test has none
+    suggestion = service.take() if service is not None else None
+    if suggestion is not None:
+        from .outbound_screen import offer_site
+
+        await offer_site(ctx, suggestion)
 
 
 class _Quit(Exception):
@@ -901,6 +923,7 @@ async def _menu_round(
     session.push(menu)
     ran_over_menu = False
     try:
+        await _offer_pending_site(ctx)  # a suggestion that waited for the menu
         selection = await menu.future
         # The Quit row asks first, in a dialog over the menu (which is still pushed). Cancel
         # ends the round and paints the menu again, and its highlight is still on the row.
@@ -913,11 +936,11 @@ async def _menu_round(
         tool = next((t for t in tools if t.name == selection), None)
         if tool is not None and tool.popup:
             ran_over_menu = True
-            await _run_selection(ctx, selection)
+            await run_tool(ctx, selection)
     finally:
         session.pop(menu)
     if not ran_over_menu:
-        await _run_selection(ctx, selection)
+        await run_tool(ctx, selection)
 
 
 async def _startup(ctx: AppContext) -> bool:
@@ -1086,6 +1109,16 @@ async def _resume_monitor(ctx: AppContext) -> Exception | None:
     # reads, and it skips silently without a device, so it is also safe to run from the
     # start.
     await ctx.battery.start()
+    # The place finder reads only stored locations and the network (tiles, Nominatim), never
+    # the device. Its first read waits some seconds, so it does not slow the start.
+    await ctx.places.start()
+    # The site suggestion only counts what the hub hears, and the menu asks the user. It
+    # never opens the device (refer to meshterm.services.site_suggest).
+    await ctx.site_suggest.start()
+    # The device routes listen for the route changes of the radio, and reconcile at each
+    # connection. They write to the radio only what the user keeps or saved for a site
+    # (refer to meshterm.services.device_routes). Nothing is transmitted.
+    await ctx.routes.start()
     if not ctx.settings.connect_on_start:
         return None
     failure: Exception | None = None
@@ -1175,8 +1208,13 @@ def _reading_caption(ctx: AppContext) -> str:
     return "reading…"
 
 
-async def _run_selection(ctx: AppContext, name: str) -> None:
+async def run_tool(ctx: AppContext, name: str) -> None:
     """Get the parameters for one tool from the menu, run the tool, and show its result.
+
+    The main menu calls it for each tool row. The page of our node calls it too, for the
+    rows of the ``This node`` section that it shows (refer to
+    :func:`~meshterm.ui.node_detail_screen.open_node_detail`). Thus a tool behaves the same
+    from both places: the same prompts, the same result, and the same failure dialog.
 
     This function does not handle a lost device link. The watcher for the full session
     (refer to :func:`_session_loop`) polls independently, and opens the reconnect dialog
